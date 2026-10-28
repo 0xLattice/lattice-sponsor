@@ -34,6 +34,10 @@ lattice-sponsor \
 - `--share-work` (default `2^24`) is the work per share.
 - `--fee` is the smallest fee it pays; the node's relay floor applies when that
   is higher.
+- `--most-pay` is the most coins it pays a client within one transaction, for
+  that client's shares. With it, a client with no coins can pay someone else:
+  buying a name, say. It defaults to the chain's block reward at the
+  template's height; at 0 it pays fees only.
 
 Credit is held in memory, so a restart forfeits unspent shares. A chain's
 reward schedule is read once, so a chain re-hosted under the same path with a
@@ -50,18 +54,28 @@ JSON; 64-bit integers are decimal strings, and targets and work are hex.
 
 | Route | Body | Returns |
 |---|---|---|
-| `POST /work` | `{client?, chain?}` | a nonce range of the template |
+| `POST /work` | `{client?, chain?, pay?}` | a nonce range of the template, and the shares that buy the fee and `pay` |
 | `POST /shares` | `{assignment, nonce}` | the client's credit on its chain |
-| `POST /sponsor` | `{client, transaction}` | the co-signed transaction |
+| `POST /sponsor` | `{client, transaction, pay?}` | the co-signed transaction |
+
+With a `pay`, the sponsor credits the client `pay` within the transaction, and
+debits itself the fee plus `pay`. The client's own debits net against that
+credit, so a purchase of exactly `pay` draws nothing from the client's
+balance.
 
 ## What it risks
 
 A client can withhold the shares that are blocks, as against any pool, and
-nothing here detects it. The float is the operator's bound on that loss. A
-signed fee is held against the float for a few of its chain's blocks, but a
-client may submit its body later than that. The sponsor never pays more than
-one fee per signature, so the cost is another client's sponsored transaction
-failing on an empty float.
+nothing here detects it. Its credit then buys fees, and with `--most-pay`,
+coins paid to the client itself: up to the fee plus `--most-pay` (by default a
+block reward) per transaction, from the key's balance, which also holds the
+blocks the sponsor wins. The float is the operator's bound on that loss; set
+`--most-pay 0` to keep it to fees.
+
+A signed fee and pay are held against the float for a few of the chain's
+blocks, but a client may submit its body later than that. The sponsor never
+pays more than one fee and pay per signature, so the cost is another client's
+sponsored transaction failing on an empty float.
 
 ## Development
 

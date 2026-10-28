@@ -306,7 +306,8 @@ public struct SponsorLedger: Sendable {
     /// Spend `fee` of `client`'s credit on `chainPath` and hold the fee
     /// against the sponsor's `balance` there until `holdUntil`: a signed fee
     /// not yet mined does not show in the balance. The caller signs only
-    /// after this returns.
+    /// after this returns. `fee` is everything the body debits the sponsor:
+    /// the fee and any payment it makes for the client.
     public mutating func commit(
         client: String, fee: UInt64, on chainPath: [String], balance: UInt64, holdUntil: Int64, now: Int64
     ) throws {
@@ -345,11 +346,14 @@ public struct SponsorLedger: Sendable {
 
 /// The body the sponsor signs for `draft`: the draft as written plus one
 /// debit of `fee` from `sponsor`, with the sponsor appended as a co-signer.
+/// With a `pay`, the sponsor also credits the client `pay` and debits itself
+/// that much more, so a client with no coins can pay within the draft: a
+/// purchase's debit of the client nets against the credit.
 ///
 /// A co-signature authorizes everything the body does, so the draft may not
 /// name the sponsor as an account, a demander or a withdrawer, or inside an
 /// action's key or values, and must balance without the sponsor, so the
-/// sponsor's debit can only ever be the fee. A chain's policies may still
+/// sponsor's debit can only ever be the fee and the client's `pay`. A chain's policies may still
 /// read the signer list, which no check here can bound: the sponsor's key
 /// must hold its fee float and nothing else. The client stays first signer:
 /// only the first signer's nonce is consensus, so the sponsor's own nonce is
@@ -358,9 +362,12 @@ public func sponsoredBody(
     draft: TransactionBody,
     sponsor: String,
     fee: UInt64,
+    pay: UInt64 = 0,
     chainPath: [String]
 ) throws -> TransactionBody {
     guard fee > 0, fee <= UInt64(Int64.max) else { throw SponsorRefusal.draft("fee out of range") }
+    let (total, overflow) = fee.addingReportingOverflow(pay)
+    guard !overflow, total <= UInt64(Int64.max) else { throw SponsorRefusal.draft("pay out of range") }
     guard draft.chainPath == chainPath else { throw SponsorRefusal.draft("wrong chain") }
     guard draft.signers.count == 1, let client = draft.signers.first, client != sponsor else {
         throw SponsorRefusal.draft("the draft must have exactly one signer, not the sponsor")
@@ -378,8 +385,9 @@ public func sponsoredBody(
     guard draft.minerSurplus() != nil else {
         throw SponsorRefusal.draft("the draft creates value")
     }
+    let paid = pay > 0 ? [AccountAction(owner: client, delta: Int64(pay))] : []
     return TransactionBody(
-        accountActions: draft.accountActions + [AccountAction(owner: sponsor, delta: -Int64(fee))],
+        accountActions: draft.accountActions + paid + [AccountAction(owner: sponsor, delta: -Int64(total))],
         actions: draft.actions,
         depositActions: draft.depositActions,
         receiptActions: draft.receiptActions,

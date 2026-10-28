@@ -280,6 +280,30 @@ final class SponsorLedgerTests: XCTestCase {
         XCTAssertTrue(Transaction(signatures: signatures, body: header).signaturesMatchSigners())
     }
 
+    /// A buyer with no coins buys from a seller: the sponsor's payment nets
+    /// the buyer's debit to nothing, so only the sponsor's account is drawn
+    /// on, by the price and the fee.
+    func testSponsoredBodyPaysWithinTheDraft() throws {
+        let buyer = CryptoUtils.createAddress(from: CryptoUtils.generateKeyPair().publicKey)
+        let seller = CryptoUtils.createAddress(from: CryptoUtils.generateKeyPair().publicKey)
+        let purchase = draft(signer: buyer, accountActions: [
+            AccountAction(owner: buyer, delta: -25), AccountAction(owner: seller, delta: 25),
+        ])
+        let body = try sponsoredBody(draft: purchase, sponsor: sponsor, fee: 3, pay: 25, chainPath: ["Nexus"])
+        XCTAssertEqual(body.signers, [buyer, sponsor])
+        XCTAssertTrue(body.accountActionsAreValid())
+        XCTAssertEqual(body.minerSurplus(), WorkSum(UInt256(3)), "the fee alone is the surplus")
+        XCTAssertEqual(try body.netBalanceDeltas(), [seller: .credit(25), sponsor: .debit(28)])
+
+        XCTAssertEqual(
+            try sponsoredBody(draft: purchase, sponsor: sponsor, fee: 3, chainPath: ["Nexus"]).accountActions.count,
+            3, "without a pay, only the fee is added"
+        )
+        XCTAssertThrowsError(try sponsoredBody(
+            draft: purchase, sponsor: sponsor, fee: 3, pay: UInt64(Int64.max), chainPath: ["Nexus"]
+        ))
+    }
+
     func testSponsoredBodyRefusesDraftsThatReachTheSponsor() {
         let client = CryptoUtils.createAddress(from: CryptoUtils.generateKeyPair().publicKey)
         let refused: [TransactionBody] = [

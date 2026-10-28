@@ -28,9 +28,13 @@
 // reach. Credit is held in memory; a restart forfeits unspent shares.
 //
 // Routes (JSON, 64-bit integers as decimal strings, targets and work as hex):
-//   POST /work     {client?, chain?}       → a nonce range of the template
-//   POST /shares   {assignment, nonce}     → the client's credit on its chain
-//   POST /sponsor  {client, transaction}   → the co-signed transaction
+//   POST /work     {client?, chain?, pay?}        → a nonce range of the template
+//   POST /shares   {assignment, nonce}            → the client's credit on its chain
+//   POST /sponsor  {client, transaction, pay?}    → the co-signed transaction
+//
+// A `pay` is coins the sponsor also credits the client in the transaction,
+// bought with the same shares as the fee, up to --most-pay (by default, the
+// chain's block reward): a client with no coins pays a seller with them.
 
 import ArgumentParser
 import Crypto
@@ -69,6 +73,9 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
     @Option(name: .long, help: "The smallest fee to pay; the node's relay floor when higher.")
     var fee: UInt64 = 0
 
+    @Option(name: .long, help: "The most coins to pay a client within one transaction, for its shares (default: the chain's block reward; 0: fees only).")
+    var mostPay: UInt64?
+
     @Option(name: .long, help: "Listen address.")
     var host: String = "127.0.0.1"
 
@@ -87,6 +94,7 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
             rpc: rpc,
             key: signer,
             minimumFee: fee,
+            mostPay: mostPay,
             tokenKey: SymmetricKey(size: .bits256)
         )
         let templates = HTTPMiningCoordinatorNodeClient(
@@ -119,7 +127,7 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
         router.post("work") { request, context in
             let input = try await request.decode(as: WorkRequest.self, context: context)
             return try await refusing {
-                try await sponsor.work(client: input.client, chainPath: input.chainPath)
+                try await sponsor.work(client: input.client, chainPath: input.chainPath, pay: input.pay ?? 0)
             }
         }
         router.post("shares") { request, context in
@@ -138,7 +146,7 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
         router.post("sponsor") { request, context in
             let input = try await request.decode(as: SponsorRequest.self, context: context)
             return try await refusing {
-                try await sponsor.sponsor(client: input.client, draft: input.transaction.body)
+                try await sponsor.sponsor(client: input.client, draft: input.transaction.body, pay: input.pay ?? 0)
             }
         }
         print("sponsor \(signer.address) listening on \(host):\(port)")
@@ -155,6 +163,9 @@ struct WorkRequest: Decodable {
     /// The chain the shares are credited on and the fee is quoted on
     /// (default Nexus).
     let chain: String?
+    /// Coins the sponsor is to pay the client as well; `sharesForFee` then
+    /// buys both.
+    @OptionalDecimalString var pay: UInt64?
 
     var chainPath: [String] {
         (chain ?? DEFAULT_ROOT_DIRECTORY).components(separatedBy: "/")
@@ -170,7 +181,9 @@ struct WorkResponse: ResponseEncodable {
     @DecimalString var count: UInt64
     /// The quoted chain's fee.
     @DecimalString var fee: UInt64
-    /// Shares that buy `fee` at the current price, saturating.
+    /// What the sponsor pays the client as well, as asked.
+    @DecimalString var pay: UInt64
+    /// Shares that buy `fee` and `pay` at the current price, saturating.
     @DecimalString var sharesForFee: UInt64
     @DecimalString var expiresInMilliseconds: UInt64
 }
@@ -189,6 +202,8 @@ struct SponsorRequest: Decodable {
     let client: String
     /// The draft: one signer (the client), no signatures needed.
     let transaction: ContentBoundTransaction
+    /// Coins the sponsor credits the client within the transaction.
+    @OptionalDecimalString var pay: UInt64?
 }
 
 struct SponsorResponse: ResponseEncodable {
@@ -196,6 +211,7 @@ struct SponsorResponse: ResponseEncodable {
     /// own over the same body and submits.
     let transaction: ContentBoundTransaction
     @DecimalString var fee: UInt64
+    @DecimalString var pay: UInt64
 }
 
 actor Sponsor {
@@ -203,6 +219,8 @@ actor Sponsor {
     private let rpc: SponsorRPC
     private let key: SponsorKey
     private let minimumFee: UInt64
+    /// Nil: the block reward of the chain paid on.
+    private let mostPay: UInt64?
     /// Signs the client tokens this sponsor issues, so a client cannot name
     /// (and so spend) a token it was not given.
     private let tokenKey: SymmetricKey
@@ -213,11 +231,15 @@ actor Sponsor {
     private var fees: [[String]: UInt64] = [:]
     private var balances: [[String]: UInt64] = [:]
 
-    init(ledger: SponsorLedger, rpc: SponsorRPC, key: SponsorKey, minimumFee: UInt64, tokenKey: SymmetricKey) {
+    init(
+        ledger: SponsorLedger, rpc: SponsorRPC, key: SponsorKey, minimumFee: UInt64, mostPay: UInt64?,
+        tokenKey: SymmetricKey
+    ) {
         self.ledger = ledger
         self.rpc = rpc
         self.key = key
         self.minimumFee = minimumFee
+        self.mostPay = mostPay
         self.tokenKey = tokenKey
     }
 
@@ -255,14 +277,15 @@ actor Sponsor {
         ), now: now())
     }
 
-    func work(client: String?, chainPath: [String]) throws -> WorkResponse {
+    func work(client: String?, chainPath: [String], pay: UInt64) throws -> WorkResponse {
         let fee = try currentFee(chainPath)
+        let total = try charge(fee: fee, pay: pay, on: chainPath)
         let client = try client.map { token in
             guard isIssued(token) else { throw SponsorRefusal.draft("unknown client token") }
             return token
         } ?? issueToken()
         let assignment = try ledger.assign(client: client, on: chainPath, now: now())
-        let shares = ledger.sharesFor(fee: fee, on: chainPath) ?? .max
+        let shares = ledger.sharesFor(fee: total, on: chainPath) ?? .max
         return WorkResponse(
             client: client,
             assignment: assignment.id,
@@ -271,6 +294,7 @@ actor Sponsor {
             startNonce: assignment.startNonce,
             count: assignment.count,
             fee: fee,
+            pay: pay,
             sharesForFee: shares > UInt256(UInt64.max) ? .max : UInt64(shares.words[0]),
             expiresInMilliseconds: UInt64(max(0, assignment.expiresAt - now()))
         )
@@ -293,11 +317,12 @@ actor Sponsor {
         return (credited, ledger.block(assignment: assignment, nonce: nonce, hash: hash, now: now()))
     }
 
-    func sponsor(client: String, draft: TransactionBody) throws -> SponsorResponse {
+    func sponsor(client: String, draft: TransactionBody, pay: UInt64) throws -> SponsorResponse {
         let chainPath = draft.chainPath
         let fee = try currentFee(chainPath)
+        let total = try charge(fee: fee, pay: pay, on: chainPath)
         let body = try sponsoredBody(
-            draft: draft, sponsor: key.address, fee: fee, chainPath: chainPath
+            draft: draft, sponsor: key.address, fee: fee, pay: pay, chainPath: chainPath
         )
         let balance = balances[chainPath] ?? 0
         // A signed fee shows in the balance only once mined; hold it for a
@@ -305,7 +330,7 @@ actor Sponsor {
         let blockTime = Int64(clamping: specs[chainPath]?.targetBlockTime ?? 0)
         let hold = max(600_000, blockTime.multipliedReportingOverflow(by: 3).partialValue)
         try ledger.commit(
-            client: client, fee: fee, on: chainPath, balance: balance, holdUntil: now() + hold, now: now()
+            client: client, fee: total, on: chainPath, balance: balance, holdUntil: now() + hold, now: now()
         )
         let header = try HeaderImpl(node: body)
         guard let signature = TransactionSigning.sign(bodyHeader: header, privateKeyHex: key.privateKey) else {
@@ -313,8 +338,20 @@ actor Sponsor {
         }
         return SponsorResponse(
             transaction: ContentBoundTransaction(signatures: [key.publicKey: signature], body: body),
-            fee: fee
+            fee: fee,
+            pay: pay
         )
+    }
+
+    /// What the sponsor spends for a fee and a payment, within --most-pay.
+    private func charge(fee: UInt64, pay: UInt64, on chainPath: [String]) throws -> UInt64 {
+        let most = mostPay ?? ledger.latest?.prices[chainPath]?.reward ?? 0
+        guard pay <= most else {
+            throw SponsorRefusal.draft("this sponsor pays at most \(most) within a transaction")
+        }
+        let (total, overflow) = fee.addingReportingOverflow(pay)
+        guard !overflow else { throw SponsorRefusal.draft("pay out of range") }
+        return total
     }
 
     private func currentFee(_ chainPath: [String]) throws -> UInt64 {
