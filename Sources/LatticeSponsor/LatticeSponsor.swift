@@ -33,8 +33,8 @@
 //   POST /sponsor  {client, transaction, pay?}    → the co-signed transaction
 //
 // A `pay` is coins the sponsor also credits the client in the transaction,
-// bought with the same shares as the fee, up to --most-pay: a client with no
-// coins pays a seller with them.
+// bought with the same shares as the fee, up to --most-pay (by default, the
+// chain's block reward): a client with no coins pays a seller with them.
 
 import ArgumentParser
 import Crypto
@@ -73,8 +73,8 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
     @Option(name: .long, help: "The smallest fee to pay; the node's relay floor when higher.")
     var fee: UInt64 = 0
 
-    @Option(name: .long, help: "The most coins to pay a client within one transaction, for its shares (0: fees only).")
-    var mostPay: UInt64 = 0
+    @Option(name: .long, help: "The most coins to pay a client within one transaction, for its shares (default: the chain's block reward; 0: fees only).")
+    var mostPay: UInt64?
 
     @Option(name: .long, help: "Listen address.")
     var host: String = "127.0.0.1"
@@ -219,7 +219,8 @@ actor Sponsor {
     private let rpc: SponsorRPC
     private let key: SponsorKey
     private let minimumFee: UInt64
-    private let mostPay: UInt64
+    /// Nil: the block reward of the chain paid on.
+    private let mostPay: UInt64?
     /// Signs the client tokens this sponsor issues, so a client cannot name
     /// (and so spend) a token it was not given.
     private let tokenKey: SymmetricKey
@@ -231,7 +232,7 @@ actor Sponsor {
     private var balances: [[String]: UInt64] = [:]
 
     init(
-        ledger: SponsorLedger, rpc: SponsorRPC, key: SponsorKey, minimumFee: UInt64, mostPay: UInt64,
+        ledger: SponsorLedger, rpc: SponsorRPC, key: SponsorKey, minimumFee: UInt64, mostPay: UInt64?,
         tokenKey: SymmetricKey
     ) {
         self.ledger = ledger
@@ -278,7 +279,7 @@ actor Sponsor {
 
     func work(client: String?, chainPath: [String], pay: UInt64) throws -> WorkResponse {
         let fee = try currentFee(chainPath)
-        let total = try charge(fee: fee, pay: pay)
+        let total = try charge(fee: fee, pay: pay, on: chainPath)
         let client = try client.map { token in
             guard isIssued(token) else { throw SponsorRefusal.draft("unknown client token") }
             return token
@@ -319,7 +320,7 @@ actor Sponsor {
     func sponsor(client: String, draft: TransactionBody, pay: UInt64) throws -> SponsorResponse {
         let chainPath = draft.chainPath
         let fee = try currentFee(chainPath)
-        let total = try charge(fee: fee, pay: pay)
+        let total = try charge(fee: fee, pay: pay, on: chainPath)
         let body = try sponsoredBody(
             draft: draft, sponsor: key.address, fee: fee, pay: pay, chainPath: chainPath
         )
@@ -343,9 +344,10 @@ actor Sponsor {
     }
 
     /// What the sponsor spends for a fee and a payment, within --most-pay.
-    private func charge(fee: UInt64, pay: UInt64) throws -> UInt64 {
-        guard pay <= mostPay else {
-            throw SponsorRefusal.draft("this sponsor pays at most \(mostPay) within a transaction")
+    private func charge(fee: UInt64, pay: UInt64, on chainPath: [String]) throws -> UInt64 {
+        let most = mostPay ?? ledger.latest?.prices[chainPath]?.reward ?? 0
+        guard pay <= most else {
+            throw SponsorRefusal.draft("this sponsor pays at most \(most) within a transaction")
         }
         let (total, overflow) = fee.addingReportingOverflow(pay)
         guard !overflow else { throw SponsorRefusal.draft("pay out of range") }

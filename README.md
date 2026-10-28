@@ -34,9 +34,10 @@ lattice-sponsor \
 - `--share-work` (default `2^24`) is the work per share.
 - `--fee` is the smallest fee it pays; the node's relay floor applies when that
   is higher.
-- `--most-pay` (default 0) is the most coins it pays a client within one
-  transaction, for that client's shares. With it, a client with no coins can
-  pay someone else: buying a name, say. At 0 it pays fees only.
+- `--most-pay` is the most coins it pays a client within one transaction, for
+  that client's shares. With it, a client with no coins can pay someone else:
+  buying a name, say. It defaults to the chain's block reward at the
+  template's height; at 0 it pays fees only.
 
 Credit is held in memory, so a restart forfeits unspent shares. A chain's
 reward schedule is read once, so a chain re-hosted under the same path with a
