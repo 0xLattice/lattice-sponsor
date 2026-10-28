@@ -66,11 +66,16 @@ balance.
 ## What it risks
 
 A client can withhold the shares that are blocks, as against any pool, and
-nothing here detects it. The float is the operator's bound on that loss. A
-signed fee is held against the float for a few of its chain's blocks, but a
-client may submit its body later than that. The sponsor never pays more than
-one fee per signature, so the cost is another client's sponsored transaction
-failing on an empty float.
+nothing here detects it. Its credit then buys fees, and with `--most-pay`,
+coins paid to the client itself: up to the fee plus `--most-pay` (by default a
+block reward) per transaction, from the key's balance, which also holds the
+blocks the sponsor wins. The float is the operator's bound on that loss; set
+`--most-pay 0` to keep it to fees.
+
+A signed fee and pay are held against the float for a few of the chain's
+blocks, but a client may submit its body later than that. The sponsor never
+pays more than one fee and pay per signature, so the cost is another client's
+sponsored transaction failing on an empty float.
 
 ## Development
 
