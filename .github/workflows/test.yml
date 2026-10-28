@@ -1,0 +1,81 @@
+name: Build & Test
+
+on:
+  merge_group:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Tests must never start a node on the built-in public peers.
+env:
+  LATTICE_FORBID_DEFAULT_PEERS: "1"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: swift:6.1-jammy
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies for Linux
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends libsqlite3-dev
+
+      - name: Build
+        run: swift build --build-tests -Xswiftc -warnings-as-errors
+
+      - name: Test
+        run: swift test --skip-build
+
+  # The sponsor against the node it is pinned to, through the node's own
+  # end-to-end harness: an unfunded key pays the fee in work, on Nexus and on
+  # a merge-mined child.
+  node-e2e:
+    runs-on: ubuntu-latest
+    container: swift:6.1-jammy
+    timeout-minutes: 90
+    env:
+      E2E_TIME_SCALE: 3
+      E2E_CTL: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies for Linux
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends libsqlite3-dev procps python3
+
+      - name: The pinned node
+        id: node
+        run: |
+          echo "revision=$(python3 -c 'import json; print(next(p["state"]["revision"] for p in json.load(open("Package.resolved"))["pins"] if p["identity"] == "lattice-node"))')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: 0xLattice/lattice-node
+          ref: ${{ steps.node.outputs.revision }}
+          path: .deps/lattice-node
+
+      - name: Build the sponsor
+        run: swift build -c release --product lattice-sponsor
+
+      - name: Build the node and its tests
+        working-directory: .deps/lattice-node
+        run: |
+          swift build -c release
+          swift build --build-tests
+
+      - name: Sponsor E2Es
+        working-directory: .deps/lattice-node
+        env:
+          E2E_NODE_BIN: ${{ github.workspace }}/.deps/lattice-node/.build/release/lattice-node
+          E2E_COORDINATOR_BIN: ${{ github.workspace }}/.deps/lattice-node/.build/release/lattice-mining-coordinator
+          E2E_MINER_BIN: ${{ github.workspace }}/.deps/lattice-node/.build/release/lattice-miner
+          E2E_CTL_BIN: ${{ github.workspace }}/.deps/lattice-node/.build/release/lattice
+          E2E_SPONSOR_BIN: ${{ github.workspace }}/.build/release/lattice-sponsor
+        run: swift test --skip-build --filter 'LatticeCtlE2ETests.testAnUnfundedKey'
