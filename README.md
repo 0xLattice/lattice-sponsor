@@ -34,6 +34,9 @@ lattice-sponsor \
 - `--share-work` (default `2^24`) is the work per share.
 - `--fee` is the smallest fee it pays; the node's relay floor applies when that
   is higher.
+- `--most-pay` (default 0) is the most coins it pays a client within one
+  transaction, for that client's shares. With it, a client with no coins can
+  pay someone else: buying a name, say. At 0 it pays fees only.
 
 Credit is held in memory, so a restart forfeits unspent shares. A chain's
 reward schedule is read once, so a chain re-hosted under the same path with a
@@ -50,9 +53,14 @@ JSON; 64-bit integers are decimal strings, and targets and work are hex.
 
 | Route | Body | Returns |
 |---|---|---|
-| `POST /work` | `{client?, chain?}` | a nonce range of the template |
+| `POST /work` | `{client?, chain?, pay?}` | a nonce range of the template, and the shares that buy the fee and `pay` |
 | `POST /shares` | `{assignment, nonce}` | the client's credit on its chain |
-| `POST /sponsor` | `{client, transaction}` | the co-signed transaction |
+| `POST /sponsor` | `{client, transaction, pay?}` | the co-signed transaction |
+
+With a `pay`, the sponsor credits the client `pay` within the transaction, and
+debits itself the fee plus `pay`. The client's own debits net against that
+credit, so a purchase of exactly `pay` draws nothing from the client's
+balance.
 
 ## What it risks
 
