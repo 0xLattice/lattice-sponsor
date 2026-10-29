@@ -352,7 +352,7 @@ actor Sponsor {
             let value = try ledger.credit(assignment: assignment, nonce: nonce, hash: hash, now: now())
             var bytes: UInt64?
             if let peer = held.peer {
-                try serving.credit(peer: peer, value: value, on: held.chainPath)
+                try serving.credit(peer: peer, value: value, on: held.chainPath, now: now())
                 bytes = UInt64(serving.owed(to: peer))
             }
             let units = ledger.credit(of: held.client, on: held.chainPath) / SponsorLedger.unit
@@ -396,8 +396,8 @@ actor Sponsor {
         } catch {
             print("serving terms fetch failed: \(error)")
         }
-        for (peer, bytes) in await servingNode.post(serving.take()) {
-            serving.restore(peer: peer, bytes: bytes)
+        for (peer, bytes) in await servingNode.post(serving.take(now: now())) {
+            serving.restore(peer: peer, bytes: bytes, now: now())
         }
     }
 

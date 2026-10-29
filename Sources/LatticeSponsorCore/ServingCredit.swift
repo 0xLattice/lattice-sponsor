@@ -1,6 +1,6 @@
 // Serving credit: work that buys a reader priority on the node's serving
 // instead of fee credit. The node sells serving by the byte, per peer, at a
-// rate in bytes per whole coin of each chain it names. A reader's share is
+// rate in bytes per coin (the chain's smallest unit) of each chain it names. A reader's share is
 // valued as for a fee (its chance of that chain's block, times its reward),
 // converted at the chain's rate, and posted to the node as the peer's serving
 // balance, a batch per peer at each refresh.
@@ -13,19 +13,24 @@ import UInt256
 
 /// The serving bytes the sponsor owes each peer, not yet posted to the node.
 public struct ServingLedger: Sendable {
-    /// Bytes per whole coin on each chain, from the node's `/serving-terms`.
+    /// Bytes per coin (the chain's smallest unit) on each chain, from the
+    /// node's `/serving-terms`.
     public private(set) var rates: [[String]: Int] = [:]
+    /// How long what is under a byte outlives the peer's last share.
+    public let lifetime: Int64
     /// Each peer's bytes, scaled by 2^64 as fee credit is, so a share worth
     /// less than a byte still counts.
-    private var pending: [String: UInt256] = [:]
+    private var pending: [String: (bytes: UInt256, lastShare: Int64)] = [:]
 
-    public init() {}
+    public init(lifetime: Int64 = 3_600_000) {
+        self.lifetime = lifetime
+    }
 
     public mutating func install(rates: [[String]: Int]) {
         self.rates = rates
     }
 
-    /// The chain's bytes per whole coin.
+    /// The chain's bytes per coin.
     public func rate(on chainPath: [String]) throws -> Int {
         guard let rate = rates[chainPath], rate > 0 else { throw SponsorRefusal.noServingRate }
         return rate
@@ -33,37 +38,39 @@ public struct ServingLedger: Sendable {
 
     /// Owe `peer` a share's `value` on `chainPath` (units scaled by 2^64),
     /// at the chain's rate, saturating.
-    public mutating func credit(peer: String, value: UInt256, on chainPath: [String]) throws {
+    public mutating func credit(peer: String, value: UInt256, on chainPath: [String], now: Int64) throws {
         let rate = try rate(on: chainPath)
         let (bytes, overflow) = value.multipliedReportingOverflow(by: UInt256(UInt64(rate)))
-        let (sum, overflowed) = (pending[peer] ?? .zero).addingReportingOverflow(overflow ? .max : bytes)
-        pending[peer] = overflowed ? .max : sum
+        let (sum, overflowed) = (pending[peer]?.bytes ?? .zero).addingReportingOverflow(overflow ? .max : bytes)
+        pending[peer] = (overflowed ? .max : sum, now)
     }
 
     /// The whole bytes owed `peer`, rounded down and saturating.
     public func owed(to peer: String) -> Int {
-        Self.whole(pending[peer] ?? .zero)
+        Self.whole(pending[peer]?.bytes ?? .zero)
     }
 
     /// Each peer's whole bytes, at most `Int.max` a post, taken off what it
-    /// is owed; what is under a byte stays owed.
-    public mutating func take() -> [String: Int] {
+    /// is owed; what is under a byte stays owed until `lifetime` after the
+    /// peer's last share.
+    public mutating func take(now: Int64) -> [String: Int] {
         var taken: [String: Int] = [:]
-        for (peer, scaled) in pending {
-            let bytes = Self.whole(scaled)
-            guard bytes > 0 else { continue }
-            taken[peer] = bytes
-            let rest = scaled - UInt256(UInt64(bytes)) * SponsorLedger.unit
-            pending[peer] = rest == .zero ? nil : rest
+        for (peer, held) in pending {
+            let bytes = Self.whole(held.bytes)
+            let rest = held.bytes - UInt256(UInt64(bytes)) * SponsorLedger.unit
+            if bytes > 0 { taken[peer] = bytes }
+            pending[peer] = rest == .zero || (bytes == 0 && now - held.lastShare >= lifetime)
+                ? nil : (rest, held.lastShare)
         }
         return taken
     }
 
     /// Owe `bytes` back to `peer`: a post that did not reach the node.
-    public mutating func restore(peer: String, bytes: Int) {
-        let (sum, overflow) = (pending[peer] ?? .zero)
+    public mutating func restore(peer: String, bytes: Int, now: Int64) {
+        let held = pending[peer]
+        let (sum, overflow) = (held?.bytes ?? .zero)
             .addingReportingOverflow(UInt256(UInt64(bytes)) * SponsorLedger.unit)
-        pending[peer] = overflow ? .max : sum
+        pending[peer] = (overflow ? .max : sum, held?.lastShare ?? now)
     }
 
     private static func whole(_ scaled: UInt256) -> Int {
@@ -95,7 +102,7 @@ public struct ServingNode: Sendable {
         case status(Int)
     }
 
-    /// Bytes per whole coin on each chain the node sells serving on.
+    /// Bytes per coin on each chain the node sells serving on.
     public func rates() async throws -> [[String]: Int] {
         struct Terms: Decodable {
             struct Rate: Decodable { let bytesPerCoin: Int }
@@ -122,21 +129,26 @@ public struct ServingNode: Sendable {
     }
 
     /// Post each peer's bytes, and return what is still owed. A peer the
-    /// node refuses (400) is dropped; once the node cannot be reached, the
-    /// rest waits for the next post.
+    /// node refuses (4xx) is dropped, and one it fails on (5xx) is kept; once
+    /// the node cannot be reached, the rest waits for the next post.
     public func post(_ owed: [String: Int]) async -> [String: Int] {
         var unposted: [String: Int] = [:]
+        var reachable = true
         for (peer, bytes) in owed {
-            guard unposted.isEmpty else {
+            guard reachable else {
                 unposted[peer] = bytes
                 continue
             }
             do {
                 try await add(peer: peer, bytes: bytes)
-            } catch Failure.status(400) {
-                print("the node refused serving balance for \(peer); dropped \(bytes) bytes")
+            } catch Failure.status(let status) where (400..<500).contains(status) {
+                print("the node refused serving balance for \(peer) (\(status)); dropped \(bytes) bytes")
+            } catch Failure.status(let status) {
+                print("serving balance post for \(peer) failed (\(status))")
+                unposted[peer] = bytes
             } catch {
                 print("serving balance post failed: \(error)")
+                reachable = false
                 unposted[peer] = bytes
             }
         }

@@ -14,7 +14,8 @@ private final class FakeNode: @unchecked Sendable {
     private let lock = NSLock()
     private var _down = false
     private var _posts: [(peer: String, bytes: Int, authorization: String?)] = []
-    var refused: Set<String> = []
+    /// Peers the node answers with a status other than 200.
+    var failing: [String: Int] = [:]
     let terms: String
 
     init(terms: String) { self.terms = terms }
@@ -44,7 +45,8 @@ private final class FakeNode: @unchecked Sendable {
         case ("POST", "/serving-balance"):
             struct Body: Decodable { let peer: String; let bytes: Int }
             let body = try JSONDecoder().decode(Body.self, from: request.httpBody ?? Data())
-            guard body.bytes > 0, !refused.contains(body.peer) else { return respond(400, "bad peer") }
+            guard body.bytes > 0 else { return respond(400, "bad bytes") }
+            if let status = failing[body.peer] { return respond(status, "") }
             lock.withLock {
                 _posts.append((body.peer, body.bytes, request.value(forHTTPHeaderField: "Authorization")))
             }
@@ -92,13 +94,13 @@ final class ServingCreditTests: XCTestCase {
 
         let value = try ledger.credit(assignment: a.id, nonce: 0, hash: UInt256(1), now: 1)
         XCTAssertEqual(value, marketShare)
-        try serving.credit(peer: "peer-a", value: value, on: market)
+        try serving.credit(peer: "peer-a", value: value, on: market, now: 1)
         XCTAssertEqual(serving.owed(to: "peer-a"), 1, "1.875 bytes, rounded down")
-        XCTAssertEqual(serving.take(), ["peer-a": 1])
-        XCTAssertEqual(serving.take(), [:], "0.875 of a byte stays owed")
+        XCTAssertEqual(serving.take(now: 2), ["peer-a": 1])
+        XCTAssertEqual(serving.take(now: 2), [:], "0.875 of a byte stays owed")
 
-        try serving.credit(peer: "peer-a", value: ledger.credit(assignment: a.id, nonce: 1, hash: UInt256(1), now: 1), on: market)
-        XCTAssertEqual(serving.take(), ["peer-a": 2], "0.875 + 1.875")
+        try serving.credit(peer: "peer-a", value: ledger.credit(assignment: a.id, nonce: 1, hash: UInt256(1), now: 1), on: market, now: 1)
+        XCTAssertEqual(serving.take(now: 2), ["peer-a": 2], "0.875 + 1.875")
 
         XCTAssertEqual(ledger.credit(of: "a", on: market), .zero, "serving work is not fee credit")
         XCTAssertThrowsError(try ledger.commit(client: "a", fee: 1, on: market, balance: 100, holdUntil: 600_000, now: 2)) {
@@ -109,11 +111,11 @@ final class ServingCreditTests: XCTestCase {
     func testBytesSaturateAndTheRestStaysOwed() throws {
         var serving = ServingLedger()
         serving.install(rates: [market: Int.max])
-        try serving.credit(peer: "p", value: UInt256(4) * SponsorLedger.unit, on: market)
-        XCTAssertEqual(serving.take(), ["p": .max])
-        XCTAssertEqual(serving.take(), ["p": .max], "one post saturates; the rest is not lost")
+        try serving.credit(peer: "p", value: UInt256(4) * SponsorLedger.unit, on: market, now: 1)
+        XCTAssertEqual(serving.take(now: 2), ["p": .max])
+        XCTAssertEqual(serving.take(now: 2), ["p": .max], "one post saturates; the rest is not lost")
 
-        try serving.credit(peer: "q", value: .max, on: market)
+        try serving.credit(peer: "q", value: .max, on: market, now: 1)
         XCTAssertEqual(serving.owed(to: "q"), .max, "the product saturates")
     }
 
@@ -124,11 +126,11 @@ final class ServingCreditTests: XCTestCase {
             XCTAssertThrowsError(try serving.rate(on: chain)) {
                 XCTAssertEqual($0 as? SponsorRefusal, .noServingRate)
             }
-            XCTAssertThrowsError(try serving.credit(peer: "p", value: SponsorLedger.unit, on: chain)) {
+            XCTAssertThrowsError(try serving.credit(peer: "p", value: SponsorLedger.unit, on: chain, now: 1)) {
                 XCTAssertEqual($0 as? SponsorRefusal, .noServingRate)
             }
         }
-        XCTAssertEqual(serving.take(), [:])
+        XCTAssertEqual(serving.take(now: 2), [:])
     }
 
     /// Bytes the node does not take while it is down stay owed and are posted
@@ -138,24 +140,47 @@ final class ServingCreditTests: XCTestCase {
         var serving = ServingLedger()
         serving.install(rates: [market: 3])
         for peer in ["a", "b"] {
-            try serving.credit(peer: peer, value: UInt256(10) * SponsorLedger.unit, on: market)
+            try serving.credit(peer: peer, value: UInt256(10) * SponsorLedger.unit, on: market, now: 1)
         }
 
         fake.down = true
-        for (peer, bytes) in await fake.node.post(serving.take()) {
-            serving.restore(peer: peer, bytes: bytes)
+        for (peer, bytes) in await fake.node.post(serving.take(now: 2)) {
+            serving.restore(peer: peer, bytes: bytes, now: 2)
         }
         XCTAssertTrue(fake.posts.isEmpty)
         XCTAssertEqual(serving.owed(to: "a"), 30)
 
         fake.down = false
-        try serving.credit(peer: "a", value: SponsorLedger.unit, on: market)
-        fake.refused = ["b"]
-        let unposted = await fake.node.post(serving.take())
+        try serving.credit(peer: "a", value: SponsorLedger.unit, on: market, now: 1)
+        let unposted = await fake.node.post(serving.take(now: 2))
         XCTAssertEqual(unposted, [:])
-        XCTAssertEqual(fake.posts.map(\.peer), ["a"], "b is refused and dropped")
-        XCTAssertEqual(fake.posts.first?.bytes, 33)
+        XCTAssertEqual(Dictionary(uniqueKeysWithValues: fake.posts.map { ($0.peer, $0.bytes) }), ["a": 33, "b": 30])
         XCTAssertEqual(fake.posts.first?.authorization, "Basic cookie")
-        XCTAssertEqual(serving.take(), [:])
+        XCTAssertEqual(serving.take(now: 2), [:])
+    }
+
+    /// A peer the node refuses (4xx) is dropped and one it fails on (5xx) is
+    /// kept, and neither holds up the others.
+    func testOnePeersFailureHoldsUpNoOther() async throws {
+        let fake = FakeNode(terms: terms)
+        fake.failing = ["refused": 422, "failing": 500]
+        let unposted = await fake.node.post(["refused": 5, "failing": 6, "a": 7])
+        XCTAssertEqual(unposted, ["failing": 6])
+        XCTAssertEqual(fake.posts.map(\.peer), ["a"])
+    }
+
+    /// What is under a byte is dropped once the peer has been idle a lifetime.
+    func testUnderAByteExpires() throws {
+        var serving = ServingLedger(lifetime: 100)
+        serving.install(rates: [market: 1])
+        try serving.credit(peer: "p", value: SponsorLedger.unit / UInt256(2), on: market, now: 0)
+        XCTAssertEqual(serving.take(now: 99), [:])
+        try serving.credit(peer: "p", value: SponsorLedger.unit / UInt256(2), on: market, now: 99)
+        XCTAssertEqual(serving.take(now: 150), ["p": 1], "half a byte twice")
+
+        try serving.credit(peer: "q", value: SponsorLedger.unit / UInt256(2), on: market, now: 200)
+        XCTAssertEqual(serving.take(now: 300), [:])
+        try serving.credit(peer: "q", value: SponsorLedger.unit / UInt256(2), on: market, now: 301)
+        XCTAssertEqual(serving.take(now: 302), [:], "the first half expired")
     }
 }
