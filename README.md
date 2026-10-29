@@ -118,8 +118,9 @@ its `entries` (CID to base64 bytes, as the node's `POST /pins` takes) or by
 pinned with the bytes given, or else read with the node's `GET /fetch`, and
 the node's `POST /pins` checks every entry against its CID. A Volume it
 refuses is `badVolume`, and nothing of the group stays pinned. A group's
-bytes are the node's: those it checked and stored, or for a Volume it already
-held, those it reads back; each Volume counts at least 1 KiB. A root with no
+bytes are those the node checked and stored, or for the operator's pin,
+those the node reads back; each Volume counts at least 1 KiB. A Volume the
+node holds for itself, unpinned, is `heldByNode`. A root with no
 credit is `unfunded`, and every CID must be spelled canonically. Stores run
 one at a time, with one more waiting; past that, `busy`.
 
@@ -133,8 +134,8 @@ root not held lapses an hour after its last share.
 The sponsor unpins only Volumes it pinned itself, once no group it holds uses
 them. A Volume the node already pinned is the operator's: a group may use it,
 it costs the budget nothing, and it is never unpinned. Groups, credit and the
-Volumes claimed are kept in one JSON file, written whole and renamed, with up
-to a few seconds of credit unwritten; at start the file is matched to the
+Volumes claimed are kept in one JSON file, written whole and renamed, every
+few seconds while no store runs and around each store; at start the file is matched to the
 node's pins, and a group missing a Volume is dropped. Storage credit buys no
 fee or serving. The node's operator routes take bodies of 2 MiB, so a Volume
 the node does not hold must fit one (`volumeTooBig`). The node's pins name no

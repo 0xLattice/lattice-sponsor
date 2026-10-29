@@ -135,6 +135,9 @@ public enum SponsorRefusal: Error, Sendable, Equatable {
     case volumeUnavailable
     /// A Volume the node does not hold is larger than one pin can carry.
     case volumeTooBig
+    /// The node already holds the Volume for itself, and its bytes there
+    /// cannot be read back reliably to size it.
+    case heldByNode
 }
 
 public struct SponsorLedger: Sendable {

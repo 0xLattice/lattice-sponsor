@@ -22,6 +22,8 @@ private final class FakeNode: @unchecked Sendable {
     /// Whether `GET /fetch` answers at all: a node under serving load
     /// answers 404 even for what it holds.
     var fetching = true
+    /// CIDs whose unpin the node fails (503).
+    var failingUnpins: Set<String> = []
 
     /// The Volumes in the node's store, by root.
     var held: [String: [String: Data]] {
@@ -78,6 +80,7 @@ private final class FakeNode: @unchecked Sendable {
             return respond(200, try JSONEncoder().encode(["pins": pins.sorted()]))
         case "DELETE" where path.hasPrefix("/pins/"):
             let cid = named
+            if failingUnpins.contains(cid) { return respond(503) }
             locked {
                 if _pins.remove(cid) != nil { _held.removeValue(forKey: cid) }
                 _unpinned.append(cid)
@@ -287,29 +290,54 @@ final class StorageCreditTests: XCTestCase {
         XCTAssertEqual(fake.unpinned, [])
     }
 
-    /// A Volume the node already holds is sized by the node's bytes, not
-    /// the uploader's: the node ignores entries given for it.
-    func testAHeldVolumeIsSizedByTheNodesBytes() async throws {
+    /// A Volume the node holds for itself is refused: the node ignores the
+    /// entries given for it, and a read of it may come from any peer.
+    func testAVolumeTheNodeHoldsForItselfIsRefused() async throws {
         let fake = FakeNode()
         fake.held = [cidOf("big"): volume("big", 90).entries!]
         let clock = Clock()
         let seller = try await seller(fake, clock, budget: 100, largestGroup: 100)
         await seller.pay(root: cidOf("a"), value: coins(1))
-        let a = try await seller.store(
-            root: cidOf("a"), volumes: [volume("a", 10), StorageNode.Volume(cid: cidOf("big"), entries: [cidOf("big"): Data()])]
-        )
-        XCTAssertEqual(a.bytes, 100)
-        XCTAssertEqual(names(fake.pins), ["a", "big"])
-
-        await seller.pay(root: cidOf("b"), value: coins(0.5))
         do {
-            let b = [StorageNode.Volume(cid: cidOf("b"), entries: [cidOf("b"): Data([1])]), StorageNode.Volume(cid: cidOf("big"))]
-            _ = try await seller.store(root: cidOf("b"), volumes: b)
-            XCTFail("b's 91 bytes at half a coin rank below a's 100 at one")
+            _ = try await seller.store(
+                root: cidOf("a"),
+                volumes: [volume("a", 10), StorageNode.Volume(cid: cidOf("big"), entries: [cidOf("big"): Data([1])])]
+            )
+            XCTFail("big is the node's")
         } catch {
-            XCTAssertEqual(error as? SponsorRefusal, .outranked)
+            XCTAssertEqual(error as? SponsorRefusal, .heldByNode)
         }
-        XCTAssertEqual(names(fake.pins), ["a", "big"], "b's own pin is undone; big stays a's")
+        XCTAssertEqual(names(fake.pins), [])
+        let claimed = await seller.ledger.state.claimed
+        XCTAssertEqual(claimed, [])
+    }
+
+    /// A rollback forgets only the claims its own store made: an orphan
+    /// claimed before, whose unpin failed, stays claimed and is unpinned later.
+    func testARollbackKeepsAnOlderOrphansClaim() async throws {
+        let fake = FakeNode()
+        let clock = Clock()
+        let seller = try await seller(fake, clock, budget: 20)
+        await seller.pay(root: cidOf("a"), value: coins(1))
+        await seller.pay(root: cidOf("b"), value: coins(5))
+        await seller.pay(root: cidOf("c"), value: coins(9))
+        _ = try await seller.store(root: cidOf("a"), volumes: [volume("a", 10), volume("o", 10)])
+        fake.failingUnpins = [cidOf("o")]
+        _ = try await seller.store(root: cidOf("b"), volumes: [volume("b", 20)])
+        XCTAssertEqual(names(fake.pins), ["b", "o"], "o's unpin failed")
+
+        let bad = StorageNode.Volume(cid: cidOf("bad"), entries: [cidOf("bad"): Data(count: 5)])
+        do {
+            _ = try await seller.store(root: cidOf("c"), volumes: [volume("c", 5), bad, StorageNode.Volume(cid: cidOf("o"))])
+            XCTFail("bad bytes")
+        } catch {
+            XCTAssertEqual(error as? SponsorRefusal, .badVolume)
+        }
+        let claimed = await seller.ledger.state.claimed
+        XCTAssertEqual(names(claimed), ["b", "o"])
+        fake.failingUnpins = []
+        await seller.maintain()
+        XCTAssertEqual(names(fake.pins), ["b"])
     }
 
     /// A Volume a held group uses as the operator's, which the operator then
@@ -335,6 +363,7 @@ final class StorageCreditTests: XCTestCase {
     /// held and cannot read now is the node's load, not a missing Volume.
     func testBytesTheNodeTookNeedNoReadBack() async throws {
         let fake = FakeNode()
+        fake.pins = [cidOf("big")]
         fake.held = [cidOf("big"): volume("big", 30).entries!]
         fake.fetching = false
         let clock = Clock()
@@ -349,7 +378,7 @@ final class StorageCreditTests: XCTestCase {
         } catch {
             XCTAssertEqual(error as? SponsorRefusal, .busy)
         }
-        XCTAssertEqual(names(fake.pins), ["a"])
+        XCTAssertEqual(names(fake.pins), ["a", "big"])
     }
 
     /// The node answers an unreadable store as no pins; while the sponsor

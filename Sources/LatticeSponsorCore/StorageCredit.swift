@@ -397,7 +397,7 @@ public actor StorageSeller {
         defer { unlock() }
         if ledger.isHeld(root) { return status(root) }
         guard ledger.credit(of: root, now: now()) > 0 else { throw SponsorRefusal.unfunded }
-        var claims: Set<String> = []
+        var fresh: Set<String> = []
         var posted: Set<String> = []
         do {
             let pinned = try await pins()
@@ -406,8 +406,9 @@ public actor StorageSeller {
             // operator's: used, never claimed. One the operator pins after
             // this read and before the pin below is claimed: the node's pins
             // name no owner. The claims are on disk, once, before any pin.
-            claims = Set(volumes.map(\.cid).filter { !pinned.contains($0) || ledger.state.claimed.contains($0) })
-            for cid in claims { ledger.claim(cid) }
+            let claims = Set(volumes.map(\.cid).filter { !pinned.contains($0) || ledger.state.claimed.contains($0) })
+            fresh = claims.subtracting(ledger.state.claimed)
+            for cid in fresh { ledger.claim(cid) }
             dirty = true
             save()
             for volume in volumes {
@@ -425,8 +426,17 @@ public actor StorageSeller {
                         }
                     }
                 }
+                // A Volume the node held for itself is sized only by a read
+                // that may come from any peer, with any valid subset of its
+                // entries: not taken at that word, unless a held group
+                // already measured it.
+                if entries == nil, claims.contains(volume.cid) {
+                    guard let known = ledger.size(of: volume.cid) else { throw SponsorRefusal.heldByNode }
+                    sizes[volume.cid] = known
+                    continue
+                }
                 if entries == nil {
-                    // The node holds it: a read it cannot serve now is its
+                    // The operator's: a read it cannot serve now is its
                     // load, not the Volume's absence.
                     do {
                         entries = try await fromNode { try await node.fetch(volume.cid) }
@@ -442,10 +452,10 @@ public actor StorageSeller {
             ledger.drop(evict)
             dirty = true
         } catch {
-            // A claim never posted is dropped, so it can never unpin what
-            // the operator pinned since; what was posted and no held group
-            // uses is unpinned.
-            for cid in claims.subtracting(posted) where !ledger.isUsed(cid) { ledger.unclaim(cid) }
+            // A claim this store made and never posted is dropped, so it can
+            // never unpin what the operator pinned since; what was posted, or
+            // claimed before, and no held group uses is unpinned.
+            for cid in fresh.subtracting(posted) { ledger.unclaim(cid) }
             await unpinOrphans()
             save()
             throw error
