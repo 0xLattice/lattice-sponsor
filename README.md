@@ -39,7 +39,11 @@ lattice-sponsor \
   buying a name, say. It defaults to the chain's block reward at the
   template's height; at 0 it pays fees only.
 
-Credit is held in memory, so a restart forfeits unspent shares. A chain's
+- `--sell-serving` lets work buy serving balance on the node instead of fee
+  credit (see [Serving credit](#serving-credit)).
+
+Credit is held in memory, so a restart forfeits unspent shares, and serving
+bytes not yet posted to the node. A chain's
 reward schedule is read once, so a chain re-hosted under the same path with a
 new genesis needs a restart.
 
@@ -54,14 +58,34 @@ JSON; 64-bit integers are decimal strings, and targets and work are hex.
 
 | Route | Body | Returns |
 |---|---|---|
-| `POST /work` | `{client?, chain?, pay?}` | a nonce range of the template, and the shares that buy the fee and `pay` |
-| `POST /shares` | `{assignment, nonce}` | the client's credit on its chain |
+| `POST /work` | `{client?, chain?, pay?, peer?}` | a nonce range of the template, and the shares that buy the fee and `pay` |
+| `POST /shares` | `{assignment, nonce}` | the client's credit on its chain, and for serving work the peer's `bytes` not yet posted |
 | `POST /sponsor` | `{client, transaction, pay?}` | the co-signed transaction |
 
 With a `pay`, the sponsor credits the client `pay` within the transaction, and
 debits itself the fee plus `pay`. The client's own debits net against that
 credit, so a purchase of exactly `pay` draws nothing from the client's
 balance.
+
+## Serving credit
+
+A node holding a chain's data serves it free while it is not busy. Under load,
+its operator may serve first the readers who paid, in coin or in work; work
+paid here buys that priority, never access itself.
+
+With `--sell-serving`, a reader advertises its Ivy peer ID as `peer` on
+`POST /work`. Its shares on that assignment are valued as for a fee, in the
+chain's smallest unit, then multiplied by the node's `bytesPerCoin` for the
+chain (from its `GET /serving-terms`), rounded down. At each refresh the
+sponsor posts each peer's whole bytes to the node's `POST /serving-balance`,
+with the RPC cookie. A chain the node sets no rate for is refused
+(`noServingRate`), and without the flag a `peer` is refused (`noServing`).
+Bytes the node does not take while it is down stay owed and are posted at a
+later refresh; a peer the node refuses is dropped.
+
+Serving work is not fee credit and pays no `pay`. The caps above apply to it
+as to fee work, and so does block withholding: a reader can withhold the
+shares that are blocks, and its credit then buys serving instead of fees.
 
 ## What it risks
 
