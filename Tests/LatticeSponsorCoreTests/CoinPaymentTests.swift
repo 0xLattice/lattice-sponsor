@@ -15,10 +15,9 @@ private let payerAddress = CryptoUtils.createAddress(from: payer.publicKey)
 private let payTo = CryptoUtils.createAddress(from: CryptoUtils.generateKeyPair().publicKey)
 
 /// One Market transfer carried at height 10, as the node's explorer and
-/// transaction routes answer it, and its operator writes, in memory.
+/// transaction routes answer it, and its pins, in memory.
 private final class FakeChain: @unchecked Sendable {
     private let lock = NSLock()
-    private var _posts: [String: Int] = [:]
     private var _pins: Set<String> = []
     let tip: UInt64
     let actions: [ExplorerAccountAction]
@@ -30,11 +29,10 @@ private final class FakeChain: @unchecked Sendable {
         self.actions = actions
     }
 
-    var posts: [String: Int] { lock.withLock { _posts } }
     var pins: Set<String> { lock.withLock { _pins } }
 
-    var node: ServingNode {
-        ServingNode(base: URL(string: "http://127.0.0.1:8080")!, authorization: { "Basic cookie" }) { request in
+    var node: SponsorNode {
+        SponsorNode(base: URL(string: "http://127.0.0.1:8080")!, authorization: { "Basic cookie" }) { request in
             try self.handle(request)
         }
     }
@@ -67,11 +65,6 @@ private final class FakeChain: @unchecked Sendable {
             struct Raw: Encodable { let cid: String; let transaction: Transaction }
             let transaction = Transaction(signatures: [payer.publicKey: "00"], body: try HeaderImpl(node: body))
             return respond(200, try JSONEncoder().encode(Raw(cid: "tx1", transaction: transaction)))
-        case ("POST", "/serving-balance"):
-            struct Body: Decodable { let peer: String; let bytes: Int }
-            let body = try JSONDecoder().decode(Body.self, from: request.httpBody ?? Data())
-            lock.withLock { _posts[body.peer, default: 0] += body.bytes }
-            return respond(200, Data("{}".utf8))
         case ("POST", "/pins"):
             struct Pin: Decodable { let cid: String }
             let pin = try JSONDecoder().decode(Pin.self, from: request.httpBody ?? Data())
@@ -83,12 +76,12 @@ private final class FakeChain: @unchecked Sendable {
     }
 }
 
-/// `tx1` claimed by `key` for `peer` or `store`.
-private func claim(peer: String? = nil, store: String? = nil, key: String = payer.privateKey, signer: String = payerAddress) -> CoinPayment {
-    let unsigned = CoinPayment(chain: "Nexus/Market", txCID: "tx1", signer: signer, signature: "", peer: peer, store: store)
+/// `tx1` claimed by `key` for `store`.
+private func claim(store: String = "root", key: String = payer.privateKey, signer: String = payerAddress) -> CoinPayment {
+    let unsigned = CoinPayment(chain: "Nexus/Market", txCID: "tx1", signer: signer, signature: "", store: store)
     return CoinPayment(
         chain: "Nexus/Market", txCID: "tx1", signer: signer,
-        signature: CryptoUtils.sign(message: unsigned.message, privateKeyHex: key)!, peer: peer, store: store
+        signature: CryptoUtils.sign(message: unsigned.message, privateKeyHex: key)!, store: store
     )
 }
 
@@ -113,7 +106,7 @@ final class CoinPaymentTests: XCTestCase {
     }
 
     func testATransferIsCreditedOnceAndAReplayIsRefused() async throws {
-        let coins = try await FakeChain().node.verify(claim(peer: "p"), payTo: payTo, depth: 6)
+        let coins = try await FakeChain().node.verify(claim(), payTo: payTo, depth: 6)
         XCTAssertEqual(coins, 4, "what it pays payTo, net")
 
         var payments = try PaymentLedger(file: file)
@@ -134,21 +127,21 @@ final class CoinPaymentTests: XCTestCase {
     }
 
     func testATransferNotDeepEnoughIsRefusedUntilItIs() async throws {
-        let shallow = await refusal(FakeChain(tip: 15), claim(peer: "p"))
+        let shallow = await refusal(FakeChain(tip: 15), claim())
         XCTAssertEqual(shallow, .notDeepEnough, "5 blocks on top of 10")
-        let deep = await refusal(FakeChain(tip: 16), claim(peer: "p"))
+        let deep = await refusal(FakeChain(tip: 16), claim())
         XCTAssertNil(deep)
     }
 
     func testOnlyASignerClaimsIt() async throws {
         let other = CryptoUtils.generateKeyPair()
-        let wrong = await refusal(FakeChain(), claim(peer: "p", key: other.privateKey, signer: CryptoUtils.createAddress(from: other.publicKey)))
+        let wrong = await refusal(FakeChain(), claim(key: other.privateKey, signer: CryptoUtils.createAddress(from: other.publicKey)))
         XCTAssertEqual(wrong, .notSigner)
     }
 
-    func testTheSignatureBindsThePeer() async throws {
-        let signed = claim(peer: "p")
-        let moved = CoinPayment(chain: "Nexus/Market", txCID: "tx1", signer: payerAddress, signature: signed.signature, peer: "q")
+    func testTheSignatureBindsTheUpload() async throws {
+        let signed = claim()
+        let moved = CoinPayment(chain: "Nexus/Market", txCID: "tx1", signer: payerAddress, signature: signed.signature, store: "other")
         let refused = await refusal(FakeChain(), moved)
         XCTAssertEqual(refused, .invalidSignature)
     }
@@ -158,21 +151,9 @@ final class CoinPaymentTests: XCTestCase {
             [ExplorerAccountAction(owner: payerAddress, delta: 0)],
             [ExplorerAccountAction(owner: payTo, delta: 4), ExplorerAccountAction(owner: payTo, delta: -4)],
         ] {
-            let refused = await refusal(FakeChain(actions: actions), claim(peer: "p"))
+            let refused = await refusal(FakeChain(actions: actions), claim())
             XCTAssertEqual(refused, .noPayment)
         }
-    }
-
-    /// 4 coins at the sponsor's own 3 bytes per coin: the node sets no rate.
-    func testServingCreditIsPostedAtTheSponsorsRate() async throws {
-        let chain = FakeChain()
-        let coins = try await chain.node.verify(claim(peer: "p"), payTo: payTo, depth: 6)
-        var serving = ServingLedger()
-        serving.install(rates: [market: 3])
-        try serving.credit(peer: "p", value: UInt256(coins) * SponsorLedger.unit, on: market, now: 0)
-        let unposted = await chain.node.post(serving.take(now: 1))
-        XCTAssertEqual(unposted, [:])
-        XCTAssertEqual(chain.posts, ["p": 12])
     }
 
     /// 4 coins at 16 bytes per coin pay for a 60-byte upload, which is pinned.

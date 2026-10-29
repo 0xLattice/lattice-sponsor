@@ -1,6 +1,6 @@
-// Coin payment: a transfer to the sponsor's --pay-to buys serving or storage
-// at the sponsor's own rates, as work does. One of the transfer's signers
-// claims it for one peer or one upload, and it is credited once it is
+// Coin payment: a transfer to the sponsor's --pay-to buys storage at the
+// sponsor's own rates, as work does. One of the transfer's signers claims it
+// for one upload, and it is credited once it is
 // --coin-depth blocks deep in the node's canonical chain, read through the
 // node's explorer and transaction routes. Each transfer is credited once; the
 // transfers credited are kept in one JSON file.
@@ -12,8 +12,8 @@ import FoundationNetworking
 import Lattice
 import LatticeNodeAPI
 
-/// `POST /pay`: a transfer on `chain`, claimed by one of its signers for
-/// exactly one of a peer's serving or an upload's storage.
+/// `POST /pay`: a transfer on `chain`, claimed by one of its signers for an
+/// upload's storage.
 public struct CoinPayment: Codable, Sendable {
     public let chain: String
     public let txCID: String
@@ -21,15 +21,14 @@ public struct CoinPayment: Codable, Sendable {
     public let signer: String
     /// The signer's signature over `message`, in hex.
     public let signature: String
-    public let peer: String?
-    public let store: String?
+    /// The upload's root.
+    public let store: String
 
-    public init(chain: String, txCID: String, signer: String, signature: String, peer: String? = nil, store: String? = nil) {
+    public init(chain: String, txCID: String, signer: String, signature: String, store: String) {
         self.chain = chain
         self.txCID = txCID
         self.signer = signer
         self.signature = signature
-        self.peer = peer
         self.store = store
     }
 
@@ -37,8 +36,8 @@ public struct CoinPayment: Codable, Sendable {
 
     /// What the signer signs, with the scheme Lattice signs transactions with
     /// (`CryptoUtils.sign`): it binds the transfer to one chain and one
-    /// peer or upload.
-    public var message: String { "lattice-sponsor-pay:v1:\(chain):\(txCID):\(peer ?? store ?? "")" }
+    /// upload.
+    public var message: String { "lattice-sponsor-pay:v1:\(chain):\(txCID):\(store)" }
 }
 
 /// The transfers already credited, kept in `file`, and those being checked.
@@ -71,7 +70,7 @@ public struct PaymentLedger: Sendable {
     }
 }
 
-extension ServingNode {
+extension SponsorNode {
     /// The coins `payment` pays `payTo`, net, once it is in the node's
     /// canonical chain with at least `depth` blocks built on its block and
     /// claimed by one of its signers. Each refusal is named.

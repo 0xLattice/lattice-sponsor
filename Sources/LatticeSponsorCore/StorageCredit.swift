@@ -197,7 +197,7 @@ public struct StorageLedger: Sendable {
     }
 }
 
-extension ServingNode {
+extension SponsorNode {
     /// Pin each of `upload`'s Volumes on the node, which checks every entry
     /// against its CID. A Volume without entries is read with `GET /fetch`,
     /// and is refused if it is larger than its declared bytes.

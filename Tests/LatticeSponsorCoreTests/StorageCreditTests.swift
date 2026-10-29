@@ -23,8 +23,8 @@ private final class FakeNode: @unchecked Sendable {
         return _pins
     }
 
-    var node: ServingNode {
-        ServingNode(base: URL(string: "http://127.0.0.1:8080")!, authorization: { "Basic cookie" }) { request in
+    var node: SponsorNode {
+        SponsorNode(base: URL(string: "http://127.0.0.1:8080")!, authorization: { "Basic cookie" }) { request in
             try self.handle(request)
         }
     }
@@ -65,7 +65,7 @@ final class StorageCreditTests: XCTestCase {
         try? FileManager.default.removeItem(at: file)
     }
 
-    /// A share on Market is 10/16 of a coin (as in `ServingCreditTests`); at
+    /// A share on Market is 10/16 of a coin (as in `SponsorLedgerTests`); at
     /// 16 bytes per coin it buys 10 bytes.
     private func ledger() -> SponsorLedger {
         var ledger = SponsorLedger(shareTarget: (UInt256(1) << 208) - UInt256(1), rangeSize: 100)
