@@ -21,23 +21,29 @@ public struct CoinPayment: Codable, Sendable {
     public let signer: String
     /// The signer's signature over `message`, in hex.
     public let signature: String
-    /// The upload's root.
-    public let store: String
+    /// The upload's root, or else
+    public let store: String?
+    /// the peer whose standing it raises.
+    public let peer: String?
 
-    public init(chain: String, txCID: String, signer: String, signature: String, store: String) {
+    public init(chain: String, txCID: String, signer: String, signature: String, store: String? = nil, peer: String? = nil) {
         self.chain = chain
         self.txCID = txCID
         self.signer = signer
         self.signature = signature
         self.store = store
+        self.peer = peer
     }
 
     public var chainPath: [String] { chain.components(separatedBy: "/") }
 
     /// What the signer signs, with the scheme Lattice signs transactions with
     /// (`CryptoUtils.sign`): it binds the transfer to one chain and one
-    /// upload.
-    public var message: String { "lattice-sponsor-pay:v1:\(chain):\(txCID):\(store)" }
+    /// upload or peer.
+    public var message: String {
+        if let peer { return "lattice-sponsor-pay-serving:v1:\(chain):\(txCID):\(peer)" }
+        return "lattice-sponsor-pay:v1:\(chain):\(txCID):\(store ?? "")"
+    }
 }
 
 /// The transfers already credited, kept in `file`, and those being checked.
@@ -75,6 +81,8 @@ extension SponsorNode {
     /// canonical chain with at least `depth` blocks built on its block and
     /// claimed by one of its signers. Each refusal is named.
     public func verify(_ payment: CoinPayment, payTo: String, depth: UInt64) async throws -> UInt64 {
+        try ServingCredit.check(peer: payment.peer, store: payment.store)
+        guard (payment.peer == nil) != (payment.store == nil) else { throw SponsorRefusal.draft("pay names a store or a peer") }
         let cid = payment.txCID
         guard !cid.isEmpty, cid.utf8.count <= 128, cid.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) }) else {
             throw SponsorRefusal.draft("txCID is not a CID")
