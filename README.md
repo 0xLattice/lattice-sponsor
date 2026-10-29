@@ -112,10 +112,12 @@ lists, root included; the sponsor reads no file format. Work comes first:
 `POST /work` with `store: <root>` (on Nexus) credits each accepted share's
 value, as for a fee, to that root. Then `POST /store` gives each Volume with
 its `entries` (CID to base64 bytes, as the node's `POST /pins` takes) or by
-`cid` only, which the sponsor reads with the node's `GET /fetch`. The node's
-`POST /pins` checks every entry against its CID; a Volume it refuses is
-`badVolume`, and nothing of the group stays pinned. A root with no credit is
-`unfunded`.
+`cid` only. A Volume the node holds is pinned by CID; one it does not is
+pinned with the bytes given, or else read with the node's `GET /fetch`, and
+the node's `POST /pins` checks every entry against its CID. A Volume it
+refuses is `badVolume`, and nothing of the group stays pinned. A group's
+bytes are the node's, read back with `GET /fetch`. A root with no credit is
+`unfunded`. Stores run one at a time, in turn.
 
 Credit halves every half-life, and paying again for a held group raises it.
 Held groups are ranked by credit per byte: one that does not fit the budget
@@ -131,7 +133,9 @@ Volumes claimed are kept in one JSON file, written whole and renamed, with up
 to a few seconds of credit unwritten; at start the file is matched to the
 node's pins, and a group missing a Volume is dropped. Storage credit buys no
 fee or serving. The node's operator routes take bodies of 2 MiB, so a Volume
-given with its bytes must fit one.
+the node does not hold must fit one (`volumeTooBig`). The node's pins name no
+owner: one the operator adds after the sponsor pinned the same Volume is the
+sponsor's to unpin.
 
 ## What it risks
 

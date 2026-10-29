@@ -598,7 +598,7 @@ func refusing<Value: Sendable>(_ body: () async throws -> Value) async throws ->
         let status: HTTPResponse.Status = switch refusal {
         case .busy, .unpriceable, .insufficientFloat, .soldOut: .serviceUnavailable
         case .insufficientCredit, .unfunded, .outranked: .init(code: 402, reasonPhrase: "Payment Required")
-        case .groupTooBig, .neverFits: .contentTooLarge
+        case .groupTooBig, .neverFits, .volumeTooBig: .contentTooLarge
         case .volumeUnavailable: .notFound
         default: .badRequest
         }

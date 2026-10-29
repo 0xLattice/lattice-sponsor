@@ -6,14 +6,23 @@ import XCTest
 import UInt256
 @testable import LatticeSponsorCore
 
-/// The node's operator pins, in memory. An entry is "the bytes its CID
-/// names" when it starts with the CID; the node checks that on `POST /pins`.
+/// The node's operator pins, in memory, as the node keeps them: a Volume it
+/// holds is pinned by CID and any entries given are ignored; one it does not
+/// is stored from the entries given, each checked against its CID. An entry
+/// is "the bytes its CID names" when it starts with the CID.
 private final class FakeNode: @unchecked Sendable {
     private let lock = NSLock()
     private var _pins: Set<String> = []
     private var _unpinned: [String] = []
-    /// What `GET /fetch` reads, by root.
+    private var _held: [String: [String: Data]] = [:]
+    /// What peers serve to `GET /fetch`, by root.
     var served: [String: [String: Data]] = [:]
+
+    /// The Volumes in the node's store, by root.
+    var held: [String: [String: Data]] {
+        get { locked { _held } }
+        set { locked { _held = newValue } }
+    }
 
     var pins: Set<String> {
         get { locked { _pins } }
@@ -45,19 +54,22 @@ private final class FakeNode: @unchecked Sendable {
             return respond(200, try JSONEncoder().encode(["pins": pins.sorted()]))
         case "GET" where path.hasPrefix("/fetch/"):
             let cid = String(path.dropFirst("/fetch/".count))
-            guard let entries = served[cid] else { return respond(404) }
+            guard let entries = held[cid] ?? served[cid] else { return respond(404) }
             return respond(200, try JSONEncoder().encode(StorageNode.Volume(cid: cid, entries: entries)))
         case "POST" where path == "/pins":
             let volume = try JSONDecoder().decode(StorageNode.Volume.self, from: request.httpBody ?? Data())
-            guard let entries = volume.entries else { return respond(404) }
-            guard entries[volume.cid] != nil,
-                  entries.allSatisfy({ $0.value.starts(with: Data($0.key.utf8)) }) else { return respond(400) }
+            if held[volume.cid] == nil {
+                guard let entries = volume.entries else { return respond(404) }
+                guard entries[volume.cid] != nil,
+                      entries.allSatisfy({ $0.value.starts(with: Data($0.key.utf8)) }) else { return respond(400) }
+                held[volume.cid] = entries
+            }
             locked { _ = _pins.insert(volume.cid) }
             return respond(200, try JSONEncoder().encode(["pins": pins.sorted()]))
         case "DELETE" where path.hasPrefix("/pins/"):
             let cid = String(path.dropFirst("/pins/".count))
             locked {
-                _pins.remove(cid)
+                if _pins.remove(cid) != nil { _held.removeValue(forKey: cid) }
                 _unpinned.append(cid)
             }
             return respond(200, try JSONEncoder().encode(["pins": pins.sorted()]))
@@ -185,7 +197,7 @@ final class StorageCreditTests: XCTestCase {
     func testTheOperatorsPinIsNeverUnpinned() async throws {
         let fake = FakeNode()
         fake.pins = ["mine"]
-        fake.served = ["mine": volume("mine", 40).entries!]
+        fake.held = ["mine": volume("mine", 40).entries!]
         let clock = Clock()
         let seller = try await seller(fake, clock, budget: 50)
         await seller.pay(root: "a", value: coins(1))
@@ -201,6 +213,62 @@ final class StorageCreditTests: XCTestCase {
         XCTAssertEqual(fake.unpinned, ["a"], "the operator's pin stays")
         let claimed = await seller.ledger.state.claimed
         XCTAssertEqual(claimed, ["b"])
+    }
+
+    /// A Volume the node already holds is sized by the node's bytes, not
+    /// the uploader's: the node ignores entries given for it.
+    func testAHeldVolumeIsSizedByTheNodesBytes() async throws {
+        let fake = FakeNode()
+        fake.held = ["big": volume("big", 90).entries!]
+        let clock = Clock()
+        let seller = try await seller(fake, clock, budget: 100, largestGroup: 100)
+        await seller.pay(root: "a", value: coins(1))
+        let a = try await seller.store(
+            root: "a", volumes: [volume("a", 10), StorageNode.Volume(cid: "big", entries: ["big": Data()])]
+        )
+        XCTAssertEqual(a.bytes, 100)
+        XCTAssertEqual(fake.pins, ["a", "big"])
+
+        await seller.pay(root: "b", value: coins(0.5))
+        do {
+            let b = [StorageNode.Volume(cid: "b", entries: ["b": Data("b".utf8)]), StorageNode.Volume(cid: "big")]
+            _ = try await seller.store(root: "b", volumes: b)
+            XCTFail("b's 91 bytes at half a coin rank below a's 100 at one")
+        } catch {
+            XCTAssertEqual(error as? SponsorRefusal, .outranked)
+        }
+        XCTAssertEqual(fake.pins, ["a", "big"], "b's own pin is undone; big stays a's")
+    }
+
+    /// A Volume a held group uses as the operator's, which the operator then
+    /// unpinned, is pinned and claimed by the next group that lists it.
+    func testAnOperatorVolumeTheOperatorDroppedIsPinnedAgain() async throws {
+        let fake = FakeNode()
+        fake.pins = ["mine"]
+        fake.held = ["mine": volume("mine", 20).entries!]
+        let clock = Clock()
+        let seller = try await seller(fake, clock)
+        await seller.pay(root: "a", value: coins(1))
+        await seller.pay(root: "b", value: coins(1))
+        _ = try await seller.store(root: "a", volumes: [volume("a", 10), StorageNode.Volume(cid: "mine")])
+        fake.pins.remove("mine")
+        _ = try await seller.store(root: "b", volumes: [volume("b", 10), StorageNode.Volume(cid: "mine")])
+        XCTAssertEqual(fake.pins, ["a", "b", "mine"])
+        let claimed = await seller.ledger.state.claimed
+        XCTAssertEqual(claimed, ["a", "b", "mine"])
+    }
+
+    /// Stores wait their turn instead of being refused.
+    func testConcurrentStoresBothLand() async throws {
+        let fake = FakeNode()
+        let clock = Clock()
+        let seller = try await seller(fake, clock)
+        await seller.pay(root: "a", value: coins(1))
+        await seller.pay(root: "b", value: coins(1))
+        async let a = seller.store(root: "a", volumes: [volume("a", 10)])
+        async let b = seller.store(root: "b", volumes: [volume("b", 10)])
+        let (heldA, heldB) = try await (a.held, b.held)
+        XCTAssertTrue(heldA && heldB)
     }
 
     func testRefusals() async throws {
@@ -225,6 +293,9 @@ final class StorageCreditTests: XCTestCase {
         XCTAssertEqual(neverFits, .neverFits)
         let missing = await refusal("a", [volume("a", 10), StorageNode.Volume(cid: "gone")])
         XCTAssertEqual(missing, .volumeUnavailable)
+        let huge = StorageNode.Volume(cid: "a", entries: ["a": Data(count: StorageNode.largestBody)])
+        let tooBigToPin = await refusal("a", [huge])
+        XCTAssertEqual(tooBigToPin, .volumeTooBig, "past the node's body limit")
         let rootless = await refusal("a", [volume("b", 10)])
         XCTAssertEqual(rootless, .draft("volumes lists each Volume once, the root among them"))
 
@@ -234,7 +305,7 @@ final class StorageCreditTests: XCTestCase {
         let badBytes = await refusal("a", [volume("a", 10), bad])
         XCTAssertEqual(badBytes, .badVolume)
         XCTAssertEqual(fake.pins, [])
-        XCTAssertEqual(fake.unpinned, ["a", "bad"])
+        XCTAssertEqual(fake.unpinned.suffix(2), ["a", "bad"])
         let a = await seller.status("a")
         XCTAssertFalse(a.held)
         let claimed = await seller.ledger.state.claimed

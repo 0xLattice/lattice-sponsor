@@ -133,6 +133,8 @@ public enum SponsorRefusal: Error, Sendable, Equatable {
     case badVolume
     /// A Volume given by CID only that neither the node nor its peers serve.
     case volumeUnavailable
+    /// A Volume the node does not hold is larger than one pin can carry.
+    case volumeTooBig
 }
 
 public struct SponsorLedger: Sendable {

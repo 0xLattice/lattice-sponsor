@@ -48,13 +48,6 @@ public struct StorageLedger: Sendable {
 
     public private(set) var state: State
 
-    /// What admitting a group takes: the groups it evicts and the Volumes
-    /// the sponsor pins for it.
-    public struct Plan: Sendable, Equatable {
-        public let evict: [String]
-        public let claim: [String]
-    }
-
     public init(
         budget: Int, largestGroup: Int, halfLife: Int64, creditLifetime: Int64 = 3_600_000,
         state: State = State()
@@ -92,10 +85,10 @@ public struct StorageLedger: Sendable {
         state.groups.values.lazy.compactMap { $0[volume] }.first
     }
 
-    /// What holding `root` with `volumes` (each with its bytes) takes, when
-    /// the node pins `pinned` now. A pinned Volume this sponsor did not claim
-    /// is the operator's: it costs the budget nothing and is never claimed.
-    public func plan(root: String, volumes: [String: Int], pinned: Set<String>, now: Int64) throws -> Plan {
+    /// The groups holding `root` with `volumes` (each with its bytes) evicts,
+    /// when the node pins `pinned` now. A pinned Volume this sponsor did not
+    /// claim is the operator's: it costs the budget nothing.
+    public func plan(root: String, volumes: [String: Int], pinned: Set<String>, now: Int64) throws -> [String] {
         let credit = credit(of: root, now: now)
         guard credit > 0 else { throw SponsorRefusal.unfunded }
         let bytes = volumes.values.reduce(0, +)
@@ -115,15 +108,18 @@ public struct StorageLedger: Sendable {
             guard self.rank(of: lowest, now: now) < rank else { throw SponsorRefusal.outranked }
             evict.append(lowest)
         }
-        let claim = volumes.keys.filter { !state.claimed.contains($0) && !operators.contains($0) }.sorted()
-        return Plan(evict: evict, claim: claim)
+        return evict
     }
 
-    /// Hold `root` with `volumes`, claiming `plan.claim`, before they are
-    /// pinned: a crash before the pins land leaves a group `reconcile` drops.
-    public mutating func hold(root: String, volumes: [String: Int], plan: Plan) {
+    /// Claim `volume` before pinning it: until a held group uses it, it is
+    /// an orphan, unpinned at the next pass.
+    public mutating func claim(_ volume: String) {
+        state.claimed.insert(volume)
+    }
+
+    /// Hold `root` with `volumes`, every one of them pinned.
+    public mutating func hold(root: String, volumes: [String: Int]) {
         state.groups[root] = volumes
-        state.claimed.formUnion(plan.claim)
     }
 
     /// Stop holding `roots`. Their credit stays, decaying, until it expires.
@@ -231,22 +227,38 @@ public struct StorageNode: Sendable {
         return Set(try JSONDecoder().decode(Pins.self, from: try await call(request("pins"))).pins)
     }
 
-    /// Pin `volume`. The node checks every entry against its CID: a refusal
-    /// of what was given (400 `invalidVolume`, 409 `conflictingVolume`) is
-    /// `badVolume`, and one it neither holds nor was given (404) is
-    /// `volumeUnavailable`.
-    public func pin(_ volume: Volume) async throws {
+    /// The largest body the node's operator routes read (Hummingbird's
+    /// default).
+    public static let largestBody = 2 << 20
+
+    /// Pin `cid`: by CID alone when the node holds it, else with the
+    /// entries `bytes` gives, each of which the node checks against its CID.
+    /// A refusal of what was given (400 `invalidVolume`, 409
+    /// `conflictingVolume`) is `badVolume`.
+    public func pin(_ cid: String, bytes: @Sendable () async throws -> [String: Data]) async throws {
+        do {
+            try await post(Volume(cid: cid))
+        } catch Failure.status(404) {
+            let body = try JSONEncoder().encode(Volume(cid: cid, entries: try await bytes()))
+            guard body.count <= Self.largestBody else { throw SponsorRefusal.volumeTooBig }
+            do {
+                try await post(body)
+            } catch Failure.status(let status) where status == 400 || status == 409 {
+                throw SponsorRefusal.badVolume
+            }
+        }
+    }
+
+    private func post(_ volume: Volume) async throws {
+        try await post(try JSONEncoder().encode(volume))
+    }
+
+    private func post(_ body: Data) async throws {
         var request = request("pins")
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONEncoder().encode(volume)
-        do {
-            _ = try await call(request)
-        } catch Failure.status(let status) where status == 400 || status == 409 {
-            throw SponsorRefusal.badVolume
-        } catch Failure.status(404) {
-            throw SponsorRefusal.volumeUnavailable
-        }
+        request.httpBody = body
+        _ = try await call(request)
     }
 
     public func unpin(_ cid: String) async throws {
@@ -295,8 +307,10 @@ public actor StorageSeller {
     /// Whether the ledger has been matched to the node's pins since boot.
     private var reconciled = false
     /// A store or an unpin in progress. One at a time: each reads which
-    /// Volumes are claimed, then changes the node's pins.
+    /// Volumes are claimed, then changes the node's pins. Stores wait their
+    /// turn in `waiting`.
     private var pinning = false
+    private var waiting: [CheckedContinuation<Void, Never>] = []
     private var dirty = false
 
     /// What an uploader reads of its group.
@@ -327,58 +341,59 @@ public actor StorageSeller {
                held: ledger.isHeld(root))
     }
 
-    /// Hold the group `root` names, its Volumes as given: pinned only once
-    /// its credit is above zero, so work naming the root comes first. A
-    /// Volume given by CID only is read with the node's `GET /fetch`; one the
-    /// sponsor pins is checked against its CIDs by the node's `POST /pins`.
+    /// Hold the group `root` names: pinned only once its credit is above
+    /// zero, so work naming the root comes first. A Volume the node holds is
+    /// pinned by CID; one it does not, with the entries given or else read
+    /// with the node's `GET /fetch`, checked against their CIDs by the
+    /// node's `POST /pins`. Every Volume's bytes are the node's, read back
+    /// with `GET /fetch`, never the uploader's word.
     public func store(root: String, volumes: [StorageNode.Volume]) async throws -> Status {
         guard volumes.contains(where: { $0.cid == root }), Set(volumes.map(\.cid)).count == volumes.count,
               volumes.allSatisfy({ !$0.cid.isEmpty && $0.cid.utf8.count <= 256 }) else {
             throw SponsorRefusal.draft("volumes lists each Volume once, the root among them")
         }
-        guard reconciled, !pinning else { throw SponsorRefusal.busy }
-        pinning = true
-        defer { pinning = false }
+        guard reconciled else { throw SponsorRefusal.busy }
+        await lock()
+        defer { unlock() }
         if ledger.isHeld(root) { return status(root) }
         guard ledger.credit(of: root, now: now()) > 0 else { throw SponsorRefusal.unfunded }
-        let pinned = try await fromNode { try await node.pins() }
-        // A Volume the node pins that this sponsor did not claim is the
-        // operator's: its size is read from the node, and it is never pinned.
-        let operators = pinned.subtracting(ledger.state.claimed)
-        var sizes: [String: Int] = [:]
-        var pins: [StorageNode.Volume] = []
-        for volume in volumes {
-            if let known = ledger.size(of: volume.cid) {
-                sizes[volume.cid] = known
-            } else {
-                let entries: [String: Data]
-                if let given = volume.entries, !operators.contains(volume.cid) {
-                    entries = given
-                } else {
-                    entries = try await fromNode { try await node.fetch(volume.cid) }
-                }
-                sizes[volume.cid] = entries.values.reduce(0) { $0 + $1.count }
-                if !operators.contains(volume.cid), !ledger.state.claimed.contains(volume.cid) {
-                    pins.append(StorageNode.Volume(cid: volume.cid, entries: entries))
-                }
-            }
-            guard sizes.values.reduce(0, +) <= ledger.largestGroup else { throw SponsorRefusal.groupTooBig }
-        }
-        let plan = try ledger.plan(root: root, volumes: sizes, pinned: pinned, now: now())
-        // On disk before the pins land: a crash between leaves a group
-        // missing Volumes, which the boot's reconcile drops and unpins.
-        ledger.hold(root: root, volumes: sizes, plan: plan)
-        dirty = true
-        save()
         do {
-            for volume in pins { try await fromNode { try await node.pin(volume) } }
+            let pinned = try await fromNode { try await node.pins() }
+            var sizes: [String: Int] = [:]
+            for volume in volumes {
+                if pinned.contains(volume.cid), let known = ledger.size(of: volume.cid) {
+                    sizes[volume.cid] = known
+                    continue
+                }
+                // A Volume the node pins that this sponsor did not claim is
+                // the operator's: used, never claimed. One the operator pins
+                // after this read and before the pin below is claimed: the
+                // node's pins name no owner.
+                if !pinned.contains(volume.cid) || ledger.state.claimed.contains(volume.cid) {
+                    ledger.claim(volume.cid)
+                    dirty = true
+                    save()
+                    try await fromNode {
+                        try await node.pin(volume.cid) {
+                            if let entries = volume.entries { return entries }
+                            return try await node.fetch(volume.cid)
+                        }
+                    }
+                }
+                let entries = try await fromNode { try await node.fetch(volume.cid) }
+                sizes[volume.cid] = entries.values.reduce(0) { $0 + $1.count }
+                guard sizes.values.reduce(0, +) <= ledger.largestGroup else { throw SponsorRefusal.groupTooBig }
+            }
+            let evict = try ledger.plan(root: root, volumes: sizes, pinned: pinned, now: now())
+            ledger.hold(root: root, volumes: sizes)
+            ledger.drop(evict)
+            dirty = true
         } catch {
-            ledger.drop([root])
+            // What this store claimed and no held group uses is unpinned.
             await unpinOrphans()
             save()
             throw error
         }
-        ledger.drop(plan.evict)
         await unpinOrphans()
         save()
         return status(root)
@@ -389,8 +404,8 @@ public actor StorageSeller {
     /// every few seconds.
     public func maintain() async {
         guard !pinning else { return }
-        pinning = true
-        defer { pinning = false }
+        await lock()
+        defer { unlock() }
         if !reconciled {
             do {
                 let pinned = try await node.pins()
@@ -408,6 +423,23 @@ public actor StorageSeller {
         if ledger.state.credits.count != credits { dirty = true }
         await unpinOrphans()
         save()
+    }
+
+    private func lock() async {
+        if pinning {
+            await withCheckedContinuation { waiting.append($0) }
+        } else {
+            pinning = true
+        }
+    }
+
+    /// Hand the turn to the next store waiting, if any.
+    private func unlock() {
+        if waiting.isEmpty {
+            pinning = false
+        } else {
+            waiting.removeFirst().resume()
+        }
     }
 
     /// Unpin each claimed Volume no held group uses; one the node does not
@@ -437,7 +469,7 @@ public actor StorageSeller {
 
     /// A node answer other than a refusal of what was given is the node's:
     /// retry shortly.
-    private func fromNode<Value>(_ body: () async throws -> Value) async throws -> Value {
+    private func fromNode<Value: Sendable>(_ body: @Sendable () async throws -> Value) async throws -> Value {
         do {
             return try await body()
         } catch let refusal as SponsorRefusal {
