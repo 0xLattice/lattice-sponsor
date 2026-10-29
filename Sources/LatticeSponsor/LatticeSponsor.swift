@@ -33,10 +33,19 @@
 // few seconds. Owed bytes are held in memory too; a post the node does not
 // take is retried at the next one. Without the flag, a peer is ignored.
 //
+// With --sell-storage, work naming a group's root CID buys that group pin
+// space on the node: each share's value on Nexus is the group's credit,
+// decaying with the operator's half-life, and held groups are ranked by
+// credit per byte within the operator's budget. Storage state is kept in one
+// JSON file, matched to the node's pins at boot. Without the flag, a store
+// root is ignored.
+//
 // Routes (JSON, 64-bit integers as decimal strings, targets and work as hex):
-//   POST /work     {client?, chain?, pay?, peer?} → a nonce range of the template
-//   POST /shares   {assignment, nonce}            → the client's credit on its chain
-//   POST /sponsor  {client, transaction, pay?}    → the co-signed transaction
+//   POST /work        {client?, chain?, pay?, peer?, store?} → a nonce range of the template
+//   POST /shares      {assignment, nonce}            → the client's credit on its chain
+//   POST /sponsor     {client, transaction, pay?}    → the co-signed transaction
+//   POST /store       {root, volumes}                → the group's status, once held
+//   GET  /store/:root                                → the group's status
 //
 // A `pay` is coins the sponsor also credits the client in the transaction,
 // bought with the same shares as the fee, up to --most-pay (by default, the
@@ -85,6 +94,24 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
     @Flag(name: .long, help: "Sell serving: work naming a reader's peer buys serving balance on the node instead of fee credit.")
     var sellServing = false
 
+    @Flag(name: .long, help: "Sell storage: work naming a group's root CID buys the group pin space on the node instead of fee credit.")
+    var sellStorage = false
+
+    @Option(name: .long, help: "With --sell-storage: the most bytes pinned across every group.")
+    var storageBudget: Int = 1 << 30
+
+    @Option(name: .long, help: "With --sell-storage: the most bytes in one group.")
+    var storageLargestGroup: Int = 16 << 20
+
+    @Option(name: .long, help: "With --sell-storage: seconds in which storage credit halves.")
+    var storageHalfLife: Int64 = 604_800
+
+    @Option(name: .long, help: "With --sell-storage: the largest POST /store body, in bytes.")
+    var storageLargestUpload: Int = 32 << 20
+
+    @Option(name: .long, help: "With --sell-storage: the file holding the groups, their credit and the Volumes pinned.")
+    var storageState: String = "sponsor-storage.json"
+
     @Option(name: .long, help: "Listen address.")
     var host: String = "127.0.0.1"
 
@@ -99,6 +126,7 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
         let signer = try SponsorKey(file: key)
         let rpc = SponsorRPC(base: base, cookieFile: URL(fileURLWithPath: cookieFile))
         let cookie = URL(fileURLWithPath: cookieFile)
+        let storage = try sellStorage ? storageSeller(base: base, cookie: cookie) : nil
         let sponsor = Sponsor(
             ledger: SponsorLedger(shareTarget: minimumWorkTarget(work)),
             rpc: rpc,
@@ -107,7 +135,8 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
             mostPay: mostPay,
             tokenKey: SymmetricKey(size: .bits256),
             servingNode: sellServing
-                ? ServingNode(base: base, authorization: { rpcCookieAuthorization(file: cookie) }) : nil
+                ? ServingNode(base: base, authorization: { rpcCookieAuthorization(file: cookie) }) : nil,
+            storage: storage
         )
         let templates = HTTPMiningCoordinatorNodeClient(
             apiBaseURL: base, cookieFile: URL(fileURLWithPath: cookieFile)
@@ -140,16 +169,25 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
             }
         }
         defer { servingPosts.cancel() }
+        let storageUpkeep = Task {
+            guard let storage else { return }
+            while !Task.isCancelled {
+                await storage.maintain()
+                try? await Task.sleep(for: .seconds(5))
+            }
+        }
+        defer { storageUpkeep.cancel() }
 
         let router = Router()
         // Wallets call this from web pages. No cookie or credential rides on
         // these requests: a client's token is in its body.
-        router.add(middleware: CORSMiddleware(allowOrigin: .all, allowMethods: [.post, .options]))
+        router.add(middleware: CORSMiddleware(allowOrigin: .all, allowMethods: [.get, .post, .options]))
         router.post("work") { request, context in
             let input = try await request.decode(as: WorkRequest.self, context: context)
             return try await refusing {
                 try await sponsor.work(
-                    client: input.client, chainPath: input.chainPath, pay: input.pay ?? 0, peer: input.peer
+                    client: input.client, chainPath: input.chainPath, pay: input.pay ?? 0, peer: input.peer,
+                    store: input.store
                 )
             }
         }
@@ -172,12 +210,57 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
                 try await sponsor.sponsor(client: input.client, draft: input.transaction.body, pay: input.pay ?? 0)
             }
         }
+        if let storage {
+            let largestUpload = storageLargestUpload
+            router.post("store") { request, _ in
+                let body: ByteBuffer
+                do {
+                    body = try await request.body.collect(upTo: largestUpload)
+                } catch {
+                    throw HTTPError(.contentTooLarge, message: "uploadTooLarge")
+                }
+                let input: StoreRequest
+                do {
+                    input = try JSONDecoder().decode(StoreRequest.self, from: Data(body.readableBytesView))
+                } catch {
+                    throw HTTPError(.badRequest)
+                }
+                return try await refusing {
+                    try await StoreStatus(storage.store(root: input.root, volumes: input.volumes))
+                }
+            }
+            router.get("store/:root") { _, context in
+                try await StoreStatus(storage.status(context.parameters.require("root")))
+            }
+        }
         print("sponsor \(signer.address) listening on \(host):\(port)")
         let app = Application(
             responder: router.buildResponder(),
             configuration: .init(address: .hostname(host, port: port))
         )
         try await app.runService()
+    }
+}
+
+extension LatticeSponsorCommand {
+    /// Storage sold for work, its ledger read from --storage-state.
+    func storageSeller(base: URL, cookie: URL) throws -> StorageSeller {
+        guard storageBudget > 0, storageLargestGroup > 0, storageLargestUpload > 0,
+              storageHalfLife > 0, storageHalfLife <= Int64.max / 1000 else {
+            throw ValidationError("the --storage- sizes and half-life must be positive")
+        }
+        let file = URL(fileURLWithPath: storageState)
+        return StorageSeller(
+            ledger: StorageLedger(
+                budget: storageBudget,
+                largestGroup: storageLargestGroup,
+                halfLife: storageHalfLife * 1000,
+                state: try StorageLedger.load(from: file)
+            ),
+            node: StorageNode(base: base, authorization: { rpcCookieAuthorization(file: cookie) }),
+            file: file,
+            now: now
+        )
     }
 }
 
@@ -192,6 +275,9 @@ struct WorkRequest: Decodable {
     /// The reader's Ivy peer ID: its shares buy serving balance on the node
     /// for that peer, not fee credit (with --sell-serving; ignored without).
     let peer: String?
+    /// A group's root CID: its shares buy that group storage credit, not
+    /// fee credit (with --sell-storage, on Nexus only; ignored without).
+    let store: String?
 
     var chainPath: [String] {
         (chain ?? DEFAULT_ROOT_DIRECTORY).components(separatedBy: "/")
@@ -226,6 +312,28 @@ struct ShareResponse: ResponseEncodable {
     /// For serving work: the bytes the sponsor owes the peer and has not yet
     /// posted to the node.
     @OptionalDecimalString var bytes: UInt64?
+}
+
+struct StoreRequest: Decodable {
+    let root: String
+    /// Every Volume of the group, the root among them, each with its entries
+    /// (CID to base64 bytes, as the node's `POST /pins` takes) or by CID only.
+    let volumes: [StorageNode.Volume]
+}
+
+struct StoreStatus: ResponseEncodable {
+    let root: String
+    @DecimalString var bytes: UInt64
+    /// The group's credit now, in Nexus coins.
+    let credit: Double
+    let held: Bool
+
+    init(_ status: StorageSeller.Status) {
+        root = status.root
+        bytes = UInt64(status.bytes)
+        credit = status.credit
+        held = status.held
+    }
 }
 
 struct SponsorRequest: Decodable {
@@ -263,10 +371,13 @@ actor Sponsor {
     /// The node's serving routes, with --sell-serving.
     private let servingNode: ServingNode?
     private var serving = ServingLedger()
+    /// Storage, with --sell-storage.
+    private let storage: StorageSeller?
 
     init(
         ledger: SponsorLedger, rpc: SponsorRPC, key: SponsorKey, minimumFee: UInt64, mostPay: UInt64?,
-        tokenKey: SymmetricKey, servingNode: ServingNode?
+        tokenKey: SymmetricKey, servingNode: ServingNode?,
+        storage: StorageSeller?
     ) {
         self.ledger = ledger
         self.rpc = rpc
@@ -275,6 +386,7 @@ actor Sponsor {
         self.mostPay = mostPay
         self.tokenKey = tokenKey
         self.servingNode = servingNode
+        self.storage = storage
     }
 
     /// Take `template` as the newest work, priced on every chain whose block
@@ -311,12 +423,24 @@ actor Sponsor {
         ), now: now())
     }
 
-    func work(client: String?, chainPath: [String], pay: UInt64, peer: String?) throws -> WorkResponse {
+    func work(
+        client: String?, chainPath: [String], pay: UInt64, peer: String?, store: String?
+    ) throws -> WorkResponse {
         var fee: UInt64 = 0
         var shares = UInt256.zero
-        // Without --sell-serving, a peer is ignored: the work is fee work.
+        // Without --sell-serving, a peer is ignored, and without
+        // --sell-storage a store root: the work is fee work.
         let peer = servingNode == nil ? nil : peer
-        if let peer {
+        let store = storage == nil ? nil : store
+        if let store {
+            guard peer == nil else { throw SponsorRefusal.draft("work buys serving or storage, not both") }
+            guard !store.isEmpty, store.utf8.count <= 256 else { throw SponsorRefusal.draft("store out of range") }
+            guard pay == 0 else { throw SponsorRefusal.draft("storage work pays nothing") }
+            // One chain's coins, so credit per byte compares across groups.
+            guard chainPath == [DEFAULT_ROOT_DIRECTORY] else {
+                throw SponsorRefusal.draft("storage work is credited on Nexus")
+            }
+        } else if let peer {
             guard !peer.isEmpty, peer.utf8.count <= 256 else { throw SponsorRefusal.draft("peer out of range") }
             guard pay == 0 else { throw SponsorRefusal.draft("serving work pays nothing") }
             _ = try serving.rate(on: chainPath)
@@ -328,8 +452,8 @@ actor Sponsor {
             guard isIssued(token) else { throw SponsorRefusal.draft("unknown client token") }
             return token
         } ?? issueToken()
-        let assignment = try ledger.assign(client: client, on: chainPath, peer: peer, now: now())
-        if peer == nil {
+        let assignment = try ledger.assign(client: client, on: chainPath, peer: peer, store: store, now: now())
+        if peer == nil, store == nil {
             shares = ledger.sharesFor(fee: total, on: chainPath) ?? .max
         }
         return WorkResponse(
@@ -348,13 +472,14 @@ actor Sponsor {
 
     /// Credit a share, and name the template it is a block of, if any,
     /// whether or not it was credited.
-    func share(assignment: String, nonce: UInt64) -> (Result<ShareResponse, any Error>, String?) {
+    func share(assignment: String, nonce: UInt64) async -> (Result<ShareResponse, any Error>, String?) {
         guard let held = ledger.assignment(assignment), let prefix = Data(hex: held.prefixHex) else {
             return (.failure(SponsorRefusal.unknownAssignment), nil)
         }
         let hash = ProofOfWork.hash(
             midstate: ProofOfWork.midstate(prefixBytes: ContiguousArray(prefix)), nonce: nonce
         )
+        var stored: (root: String, value: UInt256)?
         let credited = Result { () throws -> ShareResponse in
             // A chain without a rate is refused before the share is spent.
             if held.peer != nil { _ = try serving.rate(on: held.chainPath) }
@@ -364,10 +489,13 @@ actor Sponsor {
                 try serving.credit(peer: peer, value: value, on: held.chainPath, now: now())
                 bytes = UInt64(serving.owed(to: peer))
             }
+            if let root = held.store { stored = (root, value) }
             let units = ledger.credit(of: held.client, on: held.chainPath) / SponsorLedger.unit
             return ShareResponse(credit: units > UInt256(UInt64.max) ? .max : UInt64(units.words[0]), bytes: bytes)
         }
-        return (credited, ledger.block(assignment: assignment, nonce: nonce, hash: hash, now: now()))
+        let block = ledger.block(assignment: assignment, nonce: nonce, hash: hash, now: now())
+        if let stored { await storage?.pay(root: stored.root, value: stored.value) }
+        return (credited, block)
     }
 
     func sponsor(client: String, draft: TransactionBody, pay: UInt64) throws -> SponsorResponse {
@@ -458,7 +586,7 @@ actor Sponsor {
 }
 
 /// Milliseconds since the epoch.
-private func now() -> Int64 {
+@Sendable private func now() -> Int64 {
     Int64(Date().timeIntervalSince1970 * 1000)
 }
 
@@ -469,7 +597,9 @@ func refusing<Value: Sendable>(_ body: () async throws -> Value) async throws ->
     } catch let refusal as SponsorRefusal {
         let status: HTTPResponse.Status = switch refusal {
         case .busy, .unpriceable, .insufficientFloat, .soldOut: .serviceUnavailable
-        case .insufficientCredit: .init(code: 402, reasonPhrase: "Payment Required")
+        case .insufficientCredit, .unfunded, .outranked: .init(code: 402, reasonPhrase: "Payment Required")
+        case .groupTooBig, .neverFits: .contentTooLarge
+        case .volumeUnavailable: .notFound
         default: .badRequest
         }
         throw HTTPError(status, message: "\(refusal)")

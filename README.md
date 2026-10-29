@@ -41,9 +41,15 @@ lattice-sponsor \
 
 - `--sell-serving` lets work buy serving balance on the node instead of fee
   credit (see [Serving credit](#serving-credit)).
+- `--sell-storage` lets work buy pin space on the node (see
+  [Storage](#storage)), within `--storage-budget` bytes (default 1 GiB), at
+  most `--storage-largest-group` bytes a group (16 MiB), with credit halving
+  every `--storage-half-life` seconds (a week) and `POST /store` bodies of at
+  most `--storage-largest-upload` bytes (32 MiB). Its state is kept in
+  `--storage-state` (`sponsor-storage.json`).
 
 Credit is held in memory, so a restart forfeits unspent shares, and serving
-bytes not yet posted to the node. A chain's
+bytes not yet posted to the node; storage credit is kept on disk. A chain's
 reward schedule is read once, so a chain re-hosted under the same path with a
 new genesis needs a restart.
 
@@ -58,9 +64,11 @@ JSON; 64-bit integers are decimal strings, and targets and work are hex.
 
 | Route | Body | Returns |
 |---|---|---|
-| `POST /work` | `{client?, chain?, pay?, peer?}` | a nonce range of the template, and the shares that buy the fee and `pay` |
+| `POST /work` | `{client?, chain?, pay?, peer?, store?}` | a nonce range of the template, and the shares that buy the fee and `pay` |
 | `POST /shares` | `{assignment, nonce}` | the client's credit on its chain, and for serving work the peer's `bytes` not yet posted |
 | `POST /sponsor` | `{client, transaction, pay?}` | the co-signed transaction |
+| `POST /store` | `{root, volumes: [{cid, entries?}]}` | `{root, bytes, credit, held}` once the group is held |
+| `GET /store/:root` | | `{root, bytes, credit, held}` |
 
 With a `pay`, the sponsor credits the client `pay` within the transaction, and
 debits itself the fee plus `pay`. The client's own debits net against that
@@ -90,6 +98,40 @@ peer's last share.
 Serving work is not fee credit and pays no `pay`. The caps above apply to it
 as to fee work, and so does block withholding: a reader can withhold the
 shares that are blocks, and its credit then buys serving instead of fees.
+
+## Storage
+
+A storage sponsor sells pin space on its node for work that mines real
+blocks. Anyone can run one, and an uploader can use several for redundancy.
+Nothing on chain expires; a host only stops keeping a file. Uploaders trust
+hosts for availability only: bytes are checked by CID. A browser app can
+upload bytes without running a node.
+
+A group is named by its root CID and is exactly the Volumes its uploader
+lists, root included; the sponsor reads no file format. Work comes first:
+`POST /work` with `store: <root>` (on Nexus) credits each accepted share's
+value, as for a fee, to that root. Then `POST /store` gives each Volume with
+its `entries` (CID to base64 bytes, as the node's `POST /pins` takes) or by
+`cid` only, which the sponsor reads with the node's `GET /fetch`. The node's
+`POST /pins` checks every entry against its CID; a Volume it refuses is
+`badVolume`, and nothing of the group stays pinned. A root with no credit is
+`unfunded`.
+
+Credit halves every half-life, and paying again for a held group raises it.
+Held groups are ranked by credit per byte: one that does not fit the budget
+unpins the lowest-ranked groups, and one that would have to unpin a group
+ranked above it is `outranked`. A group over the largest group is
+`groupTooBig`, and one over the whole budget is `neverFits`. Credit for a
+root not held lapses an hour after its last share.
+
+The sponsor unpins only Volumes it pinned itself, once no group it holds uses
+them. A Volume the node already pinned is the operator's: a group may use it,
+it costs the budget nothing, and it is never unpinned. Groups, credit and the
+Volumes claimed are kept in one JSON file, written whole and renamed, with up
+to a few seconds of credit unwritten; at start the file is matched to the
+node's pins, and a group missing a Volume is dropped. Storage credit buys no
+fee or serving. The node's operator routes take bodies of 2 MiB, so a Volume
+given with its bytes must fit one.
 
 ## What it risks
 
