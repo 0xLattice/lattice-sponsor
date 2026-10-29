@@ -30,6 +30,9 @@ public struct StorageLedger: Sendable {
     public let halfLife: Int64
     /// How long credit for a root not held outlives its last share.
     public let creditLifetime: Int64
+    /// The fewest bytes a Volume counts as: a pin costs the node more than
+    /// its entries, so many tiny Volumes are not nearly free.
+    public let smallestVolume: Int
 
     public struct Credit: Codable, Sendable, Equatable {
         /// Nexus coins, as of `at`.
@@ -51,13 +54,14 @@ public struct StorageLedger: Sendable {
 
     public init(
         budget: Int, largestGroup: Int, halfLife: Int64, creditLifetime: Int64 = 3_600_000,
-        state: State = State()
+        smallestVolume: Int = 1024, state: State = State()
     ) {
-        precondition(budget > 0 && largestGroup > 0 && halfLife > 0)
+        precondition(budget > 0 && largestGroup > 0 && halfLife > 0 && smallestVolume > 0)
         self.budget = budget
         self.largestGroup = largestGroup
         self.halfLife = halfLife
         self.creditLifetime = creditLifetime
+        self.smallestVolume = smallestVolume
         self.state = state
     }
 
@@ -145,6 +149,11 @@ public struct StorageLedger: Sendable {
     /// Stop holding `roots`. Their credit stays, decaying, until it expires.
     public mutating func drop(_ roots: [String]) {
         for root in roots { state.groups.removeValue(forKey: root) }
+    }
+
+    /// Whether a held group uses `volume`.
+    public func isUsed(_ volume: String) -> Bool {
+        state.groups.values.contains { $0[volume] != nil }
     }
 
     /// Claimed Volumes no held group uses: the ones to unpin.
@@ -376,33 +385,39 @@ public actor StorageSeller {
         guard volumes.contains(where: { $0.cid == root }), Set(volumes.map(\.cid)).count == volumes.count else {
             throw SponsorRefusal.draft("volumes lists each Volume once, the root among them")
         }
+        guard volumes.count <= ledger.largestGroup / ledger.smallestVolume else { throw SponsorRefusal.groupTooBig }
         guard reconciled else { throw SponsorRefusal.busy }
-        // Only a funded root waits its turn; checked again once it comes.
+        // Only a funded root waits its turn, one behind the store running;
+        // checked again once it comes.
         if ledger.isHeld(root) { return status(root) }
         guard ledger.credit(of: root, now: now()) > 0 else { throw SponsorRefusal.unfunded }
-        guard storing.insert(root).inserted else { throw SponsorRefusal.busy }
+        guard waiting.isEmpty, storing.insert(root).inserted else { throw SponsorRefusal.busy }
         defer { storing.remove(root) }
         await lock()
         defer { unlock() }
         if ledger.isHeld(root) { return status(root) }
         guard ledger.credit(of: root, now: now()) > 0 else { throw SponsorRefusal.unfunded }
+        var claims: Set<String> = []
+        var posted: Set<String> = []
         do {
             let pinned = try await pins()
             var sizes: [String: Int] = [:]
             // A Volume the node pins that this sponsor did not claim is the
             // operator's: used, never claimed. One the operator pins after
             // this read and before the pin below is claimed: the node's pins
-            // name no owner. Each claim is on disk before its pin lands.
+            // name no owner. The claims are on disk, once, before any pin.
+            claims = Set(volumes.map(\.cid).filter { !pinned.contains($0) || ledger.state.claimed.contains($0) })
+            for cid in claims { ledger.claim(cid) }
+            dirty = true
+            save()
             for volume in volumes {
                 if pinned.contains(volume.cid), let known = ledger.size(of: volume.cid) {
                     sizes[volume.cid] = known
                     continue
                 }
                 var entries: [String: Data]?
-                if !pinned.contains(volume.cid) || ledger.state.claimed.contains(volume.cid) {
-                    ledger.claim(volume.cid)
-                    dirty = true
-                    save()
+                if claims.contains(volume.cid) {
+                    posted.insert(volume.cid)
                     entries = try await fromNode {
                         try await node.pin(volume.cid) {
                             if let entries = volume.entries { return entries }
@@ -419,7 +434,7 @@ public actor StorageSeller {
                         throw SponsorRefusal.busy
                     }
                 }
-                sizes[volume.cid] = entries!.values.reduce(0) { $0 + $1.count }
+                sizes[volume.cid] = max(ledger.smallestVolume, entries!.values.reduce(0) { $0 + $1.count })
                 guard sizes.values.reduce(0, +) <= ledger.largestGroup else { throw SponsorRefusal.groupTooBig }
             }
             let evict = try ledger.plan(root: root, volumes: sizes, pinned: pinned, now: now())
@@ -427,7 +442,10 @@ public actor StorageSeller {
             ledger.drop(evict)
             dirty = true
         } catch {
-            // What this store claimed and no held group uses is unpinned.
+            // A claim never posted is dropped, so it can never unpin what
+            // the operator pinned since; what was posted and no held group
+            // uses is unpinned.
+            for cid in claims.subtracting(posted) where !ledger.isUsed(cid) { ledger.unclaim(cid) }
             await unpinOrphans()
             save()
             throw error
@@ -471,7 +489,7 @@ public actor StorageSeller {
     private func pins() async throws -> Set<String> {
         let pinned = try await fromNode { try await node.pins() }
         guard !pinned.isEmpty || ledger.state.claimed.isEmpty else {
-            print("the node answers no pins while this sponsor claims some")
+            print("the node answers no pins while this sponsor claims some; if its store was wiped, delete --storage-state")
             throw SponsorRefusal.busy
         }
         return pinned

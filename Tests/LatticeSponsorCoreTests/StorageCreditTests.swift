@@ -162,7 +162,8 @@ final class StorageCreditTests: XCTestCase {
     ) async throws -> StorageSeller {
         let seller = StorageSeller(
             ledger: StorageLedger(
-                budget: budget, largestGroup: largestGroup, halfLife: 1000, state: try StorageLedger.load(from: file)
+                budget: budget, largestGroup: largestGroup, halfLife: 1000, smallestVolume: 1,
+                state: try StorageLedger.load(from: file)
             ),
             node: fake.node, file: file, now: { clock.now }
         )

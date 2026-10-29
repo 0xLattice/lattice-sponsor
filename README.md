@@ -46,7 +46,9 @@ lattice-sponsor \
   most `--storage-largest-group` bytes a group (16 MiB), with credit halving
   every `--storage-half-life` seconds (a week) and `POST /store` bodies of at
   most `--storage-largest-upload` bytes (32 MiB). Its state is kept in
-  `--storage-state` (`sponsor-storage.json`), which must be writable.
+  `--storage-state` (`sponsor-storage.json`), which must be writable: in the
+  image, give an absolute path on a volume. If the node's store is wiped,
+  delete it too.
 
 Credit is held in memory, so a restart forfeits unspent shares, and serving
 bytes not yet posted to the node; storage credit is kept on disk. A chain's
@@ -116,9 +118,10 @@ its `entries` (CID to base64 bytes, as the node's `POST /pins` takes) or by
 pinned with the bytes given, or else read with the node's `GET /fetch`, and
 the node's `POST /pins` checks every entry against its CID. A Volume it
 refuses is `badVolume`, and nothing of the group stays pinned. A group's
-bytes are the node's, read back with `GET /fetch`. A root with no credit is
-`unfunded`, and every CID must be spelled canonically. Stores run one at a
-time, in turn.
+bytes are the node's: those it checked and stored, or for a Volume it already
+held, those it reads back; each Volume counts at least 1 KiB. A root with no
+credit is `unfunded`, and every CID must be spelled canonically. Stores run
+one at a time, with one more waiting; past that, `busy`.
 
 Credit halves every half-life, and paying again for a held group raises it.
 Held groups are ranked by credit per byte: one that does not fit the budget
