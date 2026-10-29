@@ -49,9 +49,10 @@ public struct StorageLedger: Sendable {
     /// How long an upload not yet pinned is held.
     public let lifetime: Int64
     let file: URL
-    /// The most bytes in one Volume: its pin, base64-encoded, must fit the
-    /// node's 2 MiB request body.
+    /// The most bytes in one Volume, raw, and as the body of its pin: the
+    /// node takes a `POST /pins` body of at most 2 MiB.
     public static let largestVolume = 1 << 20
+    static let largestPin = 2 << 20
 
     public struct Upload: Sendable {
         public let volumes: [StoreVolume]
@@ -118,8 +119,10 @@ public struct StorageLedger: Sendable {
                 }
                 size = declared
             }
-            // The node takes a `POST /pins` body of at most 2 MiB.
-            guard size <= Self.largestVolume else { throw SponsorRefusal.draft("a Volume is over 1 MiB") }
+            guard size <= Self.largestVolume,
+                  try JSONEncoder().encode(volume).count < Self.largestPin - 1024 else {
+                throw SponsorRefusal.draft("a Volume is over 1 MiB")
+            }
             let (sum, overflow) = bytes.addingReportingOverflow(size)
             guard !overflow else { throw SponsorRefusal.overBudget }
             bytes = sum

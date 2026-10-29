@@ -194,7 +194,6 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
         router.post("shares") { request, context in
             let input = try await request.decode(as: ShareRequest.self, context: context)
             let (response, block, store) = await sponsor.share(assignment: input.assignment, nonce: input.nonce)
-            if let store { await sponsor.pinIfPaid(store) }
             if let block {
                 do {
                     let submitted = try await templates.submit(workId: block, nonce: input.nonce)
@@ -203,6 +202,9 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
                     print("block submit failed: \(error)")
                 }
             }
+            // Pinning reads and writes every Volume: neither the block nor
+            // the share's answer waits for it.
+            if let store { Task { await sponsor.pinIfPaid(store) } }
             return try await refusing { try response.get() }
         }
         router.post("sponsor") { request, context in
@@ -214,7 +216,9 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
         if sellStorage {
             router.post("store") { request, _ in
                 let body = try await request.body.collect(upTo: 64 << 20)
-                let input = try JSONDecoder().decode(StoreRequest.self, from: body)
+                guard let input = try? JSONDecoder().decode(StoreRequest.self, from: body) else {
+                    throw HTTPError(.badRequest, message: "not a store request")
+                }
                 return try await refusing { try await sponsor.upload(root: input.root, volumes: input.volumes) }
             }
             router.get("store/:root") { _, context in
