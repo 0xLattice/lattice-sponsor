@@ -19,6 +19,9 @@ private final class FakeNode: @unchecked Sendable {
     private var _held: [String: [String: Data]] = [:]
     /// What peers serve to `GET /fetch`, by root.
     var served: [String: [String: Data]] = [:]
+    /// Whether `GET /fetch` answers at all: a node under serving load
+    /// answers 404 even for what it holds.
+    var fetching = true
 
     /// The Volumes in the node's store, by root.
     var held: [String: [String: Data]] {
@@ -60,7 +63,7 @@ private final class FakeNode: @unchecked Sendable {
             return respond(200, try JSONEncoder().encode(["pins": pins.sorted()]))
         case "GET" where path.hasPrefix("/fetch/"):
             let cid = named
-            guard let entries = held[cid] ?? served[cid] else { return respond(404) }
+            guard fetching, let entries = held[cid] ?? served[cid] else { return respond(404) }
             return respond(200, try JSONEncoder().encode(StorageNode.Volume(cid: cid, entries: entries)))
         case "POST" where path == "/pins":
             let volume = try JSONDecoder().decode(StorageNode.Volume.self, from: request.httpBody ?? Data())
@@ -324,6 +327,56 @@ final class StorageCreditTests: XCTestCase {
         XCTAssertEqual(names(fake.pins), ["a", "b", "mine"])
         let claimed = await seller.ledger.state.claimed
         XCTAssertEqual(names(claimed), ["a", "b", "mine"])
+    }
+
+    /// A Volume pinned with the bytes given is sized by those bytes, which
+    /// the node checked and stored, without reading it back; one the node
+    /// held and cannot read now is the node's load, not a missing Volume.
+    func testBytesTheNodeTookNeedNoReadBack() async throws {
+        let fake = FakeNode()
+        fake.held = [cidOf("big"): volume("big", 30).entries!]
+        fake.fetching = false
+        let clock = Clock()
+        let seller = try await seller(fake, clock)
+        await seller.pay(root: cidOf("a"), value: coins(1))
+        let a = try await seller.store(root: cidOf("a"), volumes: [volume("a", 10)])
+        XCTAssertEqual(a.bytes, 10)
+        await seller.pay(root: cidOf("b"), value: coins(1))
+        do {
+            _ = try await seller.store(root: cidOf("b"), volumes: [volume("b", 10), StorageNode.Volume(cid: cidOf("big"))])
+            XCTFail("big cannot be sized now")
+        } catch {
+            XCTAssertEqual(error as? SponsorRefusal, .busy)
+        }
+        XCTAssertEqual(names(fake.pins), ["a"])
+    }
+
+    /// The node answers an unreadable store as no pins; while the sponsor
+    /// claims some, that is the node failing, not every pin gone.
+    func testNoPinsWhileClaimingIsTheNodeFailing() async throws {
+        let fake = FakeNode()
+        let clock = Clock()
+        let seller = try await seller(fake, clock)
+        await seller.pay(root: cidOf("a"), value: coins(1))
+        await seller.pay(root: cidOf("b"), value: coins(1))
+        _ = try await seller.store(root: cidOf("a"), volumes: [volume("a", 10)])
+        let pins = fake.pins
+        fake.pins = []
+        do {
+            _ = try await seller.store(root: cidOf("b"), volumes: [volume("b", 10)])
+            XCTFail("no pins while a is claimed")
+        } catch {
+            XCTAssertEqual(error as? SponsorRefusal, .busy)
+        }
+        fake.pins = pins
+        let held = await seller.ledger.state
+        XCTAssertEqual(names(Set(held.groups.keys)), ["a"])
+        XCTAssertEqual(names(held.claimed), ["a"])
+
+        fake.pins = []
+        let restarted = try await self.seller(fake, clock)
+        let state = await restarted.ledger.state
+        XCTAssertEqual(state, held, "the boot reconcile waits for a real answer")
     }
 
     /// Stores wait their turn instead of being refused.
