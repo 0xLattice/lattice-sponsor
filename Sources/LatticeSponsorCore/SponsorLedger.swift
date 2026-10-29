@@ -114,8 +114,6 @@ public enum SponsorRefusal: Error, Sendable, Equatable {
     case unpriceable
     /// The draft is not one the sponsor signs; the reason names why.
     case draft(String)
-    /// Work names a peer, but this sponsor does not sell serving.
-    case noServing
     /// The node sets no serving rate on the chain, so work there buys no
     /// serving balance.
     case noServingRate

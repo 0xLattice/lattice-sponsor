@@ -30,8 +30,8 @@
 // With --sell-serving, work naming a reader's Ivy peer buys serving balance
 // on the node instead of fee credit: each share's value on its chain, times
 // the node's bytes per coin there, posted to the node for that peer at each
-// refresh. Owed bytes are held in memory too; a post the node does not take
-// is retried at the next refresh.
+// few seconds. Owed bytes are held in memory too; a post the node does not
+// take is retried at the next one. Without the flag, a peer is ignored.
 //
 // Routes (JSON, 64-bit integers as decimal strings, targets and work as hex):
 //   POST /work     {client?, chain?, pay?, peer?} → a nonce range of the template
@@ -127,11 +127,19 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
                 } catch {
                     print("template fetch failed: \(error)")
                 }
-                await sponsor.postServing()
                 try? await Task.sleep(for: .seconds(5))
             }
         }
         defer { refresh.cancel() }
+        // Apart from the template refresh, so a slow node answering serving
+        // posts never lets the template expire under fee clients.
+        let servingPosts = Task {
+            while !Task.isCancelled {
+                await sponsor.postServing()
+                try? await Task.sleep(for: .seconds(5))
+            }
+        }
+        defer { servingPosts.cancel() }
 
         let router = Router()
         // Wallets call this from web pages. No cookie or credential rides on
@@ -182,7 +190,7 @@ struct WorkRequest: Decodable {
     /// buys both.
     @OptionalDecimalString var pay: UInt64?
     /// The reader's Ivy peer ID: its shares buy serving balance on the node
-    /// for that peer, not fee credit (with --sell-serving).
+    /// for that peer, not fee credit (with --sell-serving; ignored without).
     let peer: String?
 
     var chainPath: [String] {
@@ -306,8 +314,9 @@ actor Sponsor {
     func work(client: String?, chainPath: [String], pay: UInt64, peer: String?) throws -> WorkResponse {
         var fee: UInt64 = 0
         var shares = UInt256.zero
+        // Without --sell-serving, a peer is ignored: the work is fee work.
+        let peer = servingNode == nil ? nil : peer
         if let peer {
-            guard servingNode != nil else { throw SponsorRefusal.noServing }
             guard !peer.isEmpty, peer.utf8.count <= 256 else { throw SponsorRefusal.draft("peer out of range") }
             guard pay == 0 else { throw SponsorRefusal.draft("serving work pays nothing") }
             _ = try serving.rate(on: chainPath)

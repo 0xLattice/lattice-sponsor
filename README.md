@@ -79,9 +79,10 @@ chain's smallest unit, then multiplied by the node's `bytesPerCoin` for the
 chain (from its `GET /serving-terms`), rounded down. At each refresh the
 sponsor posts each peer's whole bytes to the node's `POST /serving-balance`,
 with the RPC cookie. A chain the node sets no rate for is refused
-(`noServingRate`), and without the flag a `peer` is refused (`noServing`).
-Bytes the node does not take while it is down (or failing, 5xx) stay owed
-and are posted at a later refresh; a peer the node refuses (4xx) is dropped.
+(`noServingRate`); without the flag a `peer` is ignored and the work is fee
+work. Bytes the node does not take (it is down, failing or refusing the
+sponsor) stay owed and are posted later; a peer the node refuses (400, 422)
+is dropped.
 A post whose answer is lost, though the node applied it, is posted again, so
 the peer may be credited twice. Under a byte stays owed for an hour after the
 peer's last share.

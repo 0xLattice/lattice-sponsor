@@ -21,11 +21,17 @@ private final class FakeNode: @unchecked Sendable {
     init(terms: String) { self.terms = terms }
 
     var down: Bool {
-        get { lock.withLock { _down } }
-        set { lock.withLock { _down = newValue } }
+        get { locked { _down } }
+        set { locked { _down = newValue } }
     }
 
-    var posts: [(peer: String, bytes: Int, authorization: String?)] { lock.withLock { _posts } }
+    var posts: [(peer: String, bytes: Int, authorization: String?)] { locked { _posts } }
+
+    private func locked<Value>(_ body: () -> Value) -> Value {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
+    }
 
     var node: ServingNode {
         ServingNode(base: URL(string: "http://127.0.0.1:8080")!, authorization: { "Basic cookie" }) { request in
@@ -47,7 +53,7 @@ private final class FakeNode: @unchecked Sendable {
             let body = try JSONDecoder().decode(Body.self, from: request.httpBody ?? Data())
             guard body.bytes > 0 else { return respond(400, "bad bytes") }
             if let status = failing[body.peer] { return respond(status, "") }
-            lock.withLock {
+            locked {
                 _posts.append((body.peer, body.bytes, request.value(forHTTPHeaderField: "Authorization")))
             }
             return respond(200, #"{"peer":"\#(body.peer)","balance":\#(body.bytes)}"#)
@@ -159,7 +165,7 @@ final class ServingCreditTests: XCTestCase {
         XCTAssertEqual(serving.take(now: 2), [:])
     }
 
-    /// A peer the node refuses (4xx) is dropped and one it fails on (5xx) is
+    /// A peer the node refuses (422) is dropped and one it fails on (5xx) is
     /// kept, and neither holds up the others.
     func testOnePeersFailureHoldsUpNoOther() async throws {
         let fake = FakeNode(terms: terms)
@@ -167,6 +173,15 @@ final class ServingCreditTests: XCTestCase {
         let unposted = await fake.node.post(["refused": 5, "failing": 6, "a": 7])
         XCTAssertEqual(unposted, ["failing": 6])
         XCTAssertEqual(fake.posts.map(\.peer), ["a"])
+    }
+
+    /// An answer about the sponsor, not the peer (here 401), drops nothing.
+    func testAnUnauthorizedPostKeepsEveryPeer() async throws {
+        let fake = FakeNode(terms: terms)
+        fake.failing = ["a": 401, "b": 401]
+        let unposted = await fake.node.post(["a": 5, "b": 6])
+        XCTAssertEqual(unposted, ["a": 5, "b": 6])
+        XCTAssertTrue(fake.posts.isEmpty)
     }
 
     /// What is under a byte is dropped once the peer has been idle a lifetime.

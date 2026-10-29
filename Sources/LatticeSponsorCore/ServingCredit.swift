@@ -129,8 +129,9 @@ public struct ServingNode: Sendable {
     }
 
     /// Post each peer's bytes, and return what is still owed. A peer the
-    /// node refuses (4xx) is dropped, and one it fails on (5xx) is kept; once
-    /// the node cannot be reached, the rest waits for the next post.
+    /// node refuses (400, 422) is dropped, and one it fails on (5xx) is kept.
+    /// Any other answer (unreachable, unauthorized, no such route) is the
+    /// node's, not the peer's: it and the rest wait for the next post.
     public func post(_ owed: [String: Int]) async -> [String: Int] {
         var unposted: [String: Int] = [:]
         var reachable = true
@@ -141,9 +142,9 @@ public struct ServingNode: Sendable {
             }
             do {
                 try await add(peer: peer, bytes: bytes)
-            } catch Failure.status(let status) where (400..<500).contains(status) {
+            } catch Failure.status(let status) where status == 400 || status == 422 {
                 print("the node refused serving balance for \(peer) (\(status)); dropped \(bytes) bytes")
-            } catch Failure.status(let status) {
+            } catch Failure.status(let status) where (500..<600).contains(status) {
                 print("serving balance post for \(peer) failed (\(status))")
                 unposted[peer] = bytes
             } catch {
