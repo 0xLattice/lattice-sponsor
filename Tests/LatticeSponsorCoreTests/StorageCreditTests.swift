@@ -3,13 +3,15 @@ import Foundation
 import FoundationNetworking
 #endif
 import XCTest
+import Lattice
 import UInt256
 @testable import LatticeSponsorCore
 
 /// The node's operator pins, in memory, as the node keeps them: a Volume it
 /// holds is pinned by CID and any entries given are ignored; one it does not
 /// is stored from the entries given, each checked against its CID. An entry
-/// is "the bytes its CID names" when it starts with the CID.
+/// is "the bytes its CID names" when it starts with a 1 byte. A CID that is
+/// not canonical is refused (400), as by the node.
 private final class FakeNode: @unchecked Sendable {
     private let lock = NSLock()
     private var _pins: Set<String> = []
@@ -49,25 +51,30 @@ private final class FakeNode: @unchecked Sendable {
             (body, HTTPURLResponse(url: url, statusCode: status, httpVersion: nil, headerFields: nil)!)
         }
         let path = url.path
+        let named = path.split(separator: "/", omittingEmptySubsequences: true).last.map(String.init) ?? ""
+        if path.hasPrefix("/pins/") || path.hasPrefix("/fetch/"), !CIDIdentity.isCanonical(named) {
+            return respond(400)
+        }
         switch request.httpMethod ?? "GET" {
         case "GET" where path == "/pins":
             return respond(200, try JSONEncoder().encode(["pins": pins.sorted()]))
         case "GET" where path.hasPrefix("/fetch/"):
-            let cid = String(path.dropFirst("/fetch/".count))
+            let cid = named
             guard let entries = held[cid] ?? served[cid] else { return respond(404) }
             return respond(200, try JSONEncoder().encode(StorageNode.Volume(cid: cid, entries: entries)))
         case "POST" where path == "/pins":
             let volume = try JSONDecoder().decode(StorageNode.Volume.self, from: request.httpBody ?? Data())
+            guard CIDIdentity.isCanonical(volume.cid) else { return respond(400) }
             if held[volume.cid] == nil {
                 guard let entries = volume.entries else { return respond(404) }
                 guard entries[volume.cid] != nil,
-                      entries.allSatisfy({ $0.value.starts(with: Data($0.key.utf8)) }) else { return respond(400) }
+                      entries.allSatisfy({ $0.value.first == 1 }) else { return respond(400) }
                 held[volume.cid] = entries
             }
             locked { _ = _pins.insert(volume.cid) }
             return respond(200, try JSONEncoder().encode(["pins": pins.sorted()]))
         case "DELETE" where path.hasPrefix("/pins/"):
-            let cid = String(path.dropFirst("/pins/".count))
+            let cid = named
             locked {
                 if _pins.remove(cid) != nil { _held.removeValue(forKey: cid) }
                 _unpinned.append(cid)
@@ -88,9 +95,48 @@ private final class Clock: @unchecked Sendable {
     }
 }
 
-/// A one-entry Volume of `size` bytes whose bytes are what its CID names.
-private func volume(_ cid: String, _ size: Int) -> StorageNode.Volume {
-    StorageNode.Volume(cid: cid, entries: [cid: Data(cid.utf8) + Data(count: size - cid.utf8.count)])
+private let base32 = Array("abcdefghijklmnopqrstuvwxyz234567".utf8)
+
+/// A canonical CID (v1, raw, sha2-256) whose digest spells `name`.
+private func cidOf(_ name: String) -> String {
+    let bytes = [0x01, 0x55, 0x12, 0x20] + Array(name.utf8) + [UInt8](repeating: 0, count: 32 - name.utf8.count)
+    var text = "b"
+    var buffer = 0, bits = 0
+    for byte in bytes {
+        buffer = (buffer << 8 | Int(byte)) & 0xffff
+        bits += 8
+        while bits >= 5 {
+            bits -= 5
+            text.append(Character(Unicode.Scalar(base32[buffer >> bits & 31])))
+        }
+    }
+    if bits > 0 { text.append(Character(Unicode.Scalar(base32[buffer << (5 - bits) & 31]))) }
+    return text
+}
+
+/// The name `cidOf(_:)` spelled into `cid`.
+private func nameOf(_ cid: String) -> String {
+    var bytes: [UInt8] = []
+    var buffer = 0, bits = 0
+    for char in cid.utf8.dropFirst() {
+        buffer = (buffer << 5 | base32.firstIndex(of: char)!) & 0xffff
+        bits += 5
+        if bits >= 8 {
+            bits -= 8
+            bytes.append(UInt8(buffer >> bits & 0xff))
+        }
+    }
+    return String(decoding: bytes.dropFirst(4).prefix { $0 != 0 }, as: UTF8.self)
+}
+
+private func names(_ cids: Set<String>) -> Set<String> {
+    Set(cids.map(nameOf))
+}
+
+/// A one-entry Volume of `size` bytes, named `name`, whose bytes are what
+/// its CID names.
+private func volume(_ name: String, _ size: Int) -> StorageNode.Volume {
+    StorageNode.Volume(cid: cidOf(name), entries: [cidOf(name): Data(repeating: 1, count: size)])
 }
 
 private func coins(_ value: Double) -> UInt256 {
@@ -139,35 +185,35 @@ final class StorageCreditTests: XCTestCase {
         let fake = FakeNode()
         let clock = Clock()
         let seller = try await seller(fake, clock)
-        await seller.pay(root: "a", value: coins(1))
-        await seller.pay(root: "b", value: coins(3))
-        await seller.pay(root: "c", value: coins(2))
-        await seller.pay(root: "d", value: coins(1))
-        _ = try await seller.store(root: "a", volumes: [volume("a", 50)])
-        _ = try await seller.store(root: "b", volumes: [volume("b", 50)])
-        let c = try await seller.store(root: "c", volumes: [volume("c", 50)])
+        await seller.pay(root: cidOf("a"), value: coins(1))
+        await seller.pay(root: cidOf("b"), value: coins(3))
+        await seller.pay(root: cidOf("c"), value: coins(2))
+        await seller.pay(root: cidOf("d"), value: coins(1))
+        _ = try await seller.store(root: cidOf("a"), volumes: [volume("a", 50)])
+        _ = try await seller.store(root: cidOf("b"), volumes: [volume("b", 50)])
+        let c = try await seller.store(root: cidOf("c"), volumes: [volume("c", 50)])
         XCTAssertTrue(c.held)
         XCTAssertEqual(c.bytes, 50)
         XCTAssertEqual(c.credit, 2)
-        XCTAssertEqual(fake.pins, ["b", "c"], "a ranked lowest")
-        XCTAssertEqual(fake.unpinned, ["a"])
-        let a = await seller.status("a")
+        XCTAssertEqual(names(fake.pins), ["b", "c"], "a ranked lowest")
+        XCTAssertEqual(fake.unpinned.map(nameOf), ["a"])
+        let a = await seller.status(cidOf("a"))
         XCTAssertFalse(a.held)
 
         do {
-            _ = try await seller.store(root: "d", volumes: [volume("d", 50)])
+            _ = try await seller.store(root: cidOf("d"), volumes: [volume("d", 50)])
             XCTFail("d ranks below everything held")
         } catch {
             XCTAssertEqual(error as? SponsorRefusal, .outranked)
         }
-        XCTAssertEqual(fake.pins, ["b", "c"])
+        XCTAssertEqual(names(fake.pins), ["b", "c"])
 
         // Paying again raises a held group's rank: a smaller group with less
         // credit still ranks by credit per byte.
-        await seller.pay(root: "b", value: coins(1))
-        await seller.pay(root: "e", value: coins(1.5))
-        _ = try await seller.store(root: "e", volumes: [volume("e", 30)])
-        XCTAssertEqual(fake.pins, ["b", "e"], "e (0.05 a byte) outranks c (0.04)")
+        await seller.pay(root: cidOf("b"), value: coins(1))
+        await seller.pay(root: cidOf("e"), value: coins(1.5))
+        _ = try await seller.store(root: cidOf("e"), volumes: [volume("e", 30)])
+        XCTAssertEqual(names(fake.pins), ["b", "e"], "e (0.05 a byte) outranks c (0.04)")
     }
 
     /// A Volume two groups use is unpinned only once neither is held.
@@ -176,86 +222,108 @@ final class StorageCreditTests: XCTestCase {
         let clock = Clock()
         let seller = try await seller(fake, clock)
         for (root, credit) in [("a", 1.0), ("b", 2.0), ("c", 8.0), ("d", 9.0)] {
-            await seller.pay(root: root, value: coins(credit))
+            await seller.pay(root: cidOf(root), value: coins(credit))
         }
-        _ = try await seller.store(root: "a", volumes: [volume("a", 10), volume("shared", 30)])
+        _ = try await seller.store(root: cidOf("a"), volumes: [volume("a", 10), volume("shared", 30)])
         // The shared Volume by CID only: the sponsor already holds it.
-        _ = try await seller.store(root: "b", volumes: [volume("b", 10), StorageNode.Volume(cid: "shared")])
-        XCTAssertEqual(fake.pins, ["a", "b", "shared"])
+        _ = try await seller.store(root: cidOf("b"), volumes: [volume("b", 10), StorageNode.Volume(cid: cidOf("shared"))])
+        XCTAssertEqual(names(fake.pins), ["a", "b", "shared"])
 
-        _ = try await seller.store(root: "c", volumes: [volume("c", 60)])
-        XCTAssertEqual(fake.pins, ["b", "c", "shared"], "a went; b still uses shared")
-        XCTAssertEqual(fake.unpinned, ["a"])
+        _ = try await seller.store(root: cidOf("c"), volumes: [volume("c", 60)])
+        XCTAssertEqual(names(fake.pins), ["b", "c", "shared"], "a went; b still uses shared")
+        XCTAssertEqual(fake.unpinned.map(nameOf), ["a"])
 
-        _ = try await seller.store(root: "d", volumes: [volume("d", 10)])
-        XCTAssertEqual(fake.pins, ["c", "d"])
-        XCTAssertEqual(fake.unpinned, ["a", "b", "shared"])
+        _ = try await seller.store(root: cidOf("d"), volumes: [volume("d", 10)])
+        XCTAssertEqual(names(fake.pins), ["c", "d"])
+        XCTAssertEqual(fake.unpinned.map(nameOf), ["a", "b", "shared"])
     }
 
     /// A Volume the operator pinned first is used, read from the node for its
     /// size, costs the budget nothing, and is never unpinned.
     func testTheOperatorsPinIsNeverUnpinned() async throws {
         let fake = FakeNode()
-        fake.pins = ["mine"]
-        fake.held = ["mine": volume("mine", 40).entries!]
+        fake.pins = [cidOf("mine")]
+        fake.held = [cidOf("mine"): volume("mine", 40).entries!]
         let clock = Clock()
         let seller = try await seller(fake, clock, budget: 50)
-        await seller.pay(root: "a", value: coins(1))
-        await seller.pay(root: "b", value: coins(5))
+        await seller.pay(root: cidOf("a"), value: coins(1))
+        await seller.pay(root: cidOf("b"), value: coins(5))
         // The uploader's bytes for the operator's Volume are not taken at
         // their word: its size is read from the node.
-        let a = try await seller.store(root: "a", volumes: [volume("a", 10), volume("mine", 5)])
+        let a = try await seller.store(root: cidOf("a"), volumes: [volume("a", 10), volume("mine", 5)])
         XCTAssertEqual(a.bytes, 50)
-        XCTAssertEqual(fake.pins, ["a", "mine"])
+        XCTAssertEqual(names(fake.pins), ["a", "mine"])
 
-        _ = try await seller.store(root: "b", volumes: [volume("b", 50)])
-        XCTAssertEqual(fake.pins, ["b", "mine"])
-        XCTAssertEqual(fake.unpinned, ["a"], "the operator's pin stays")
+        _ = try await seller.store(root: cidOf("b"), volumes: [volume("b", 50)])
+        XCTAssertEqual(names(fake.pins), ["b", "mine"])
+        XCTAssertEqual(fake.unpinned.map(nameOf), ["a"], "the operator's pin stays")
         let claimed = await seller.ledger.state.claimed
-        XCTAssertEqual(claimed, ["b"])
+        XCTAssertEqual(names(claimed), ["b"])
+    }
+
+    /// A CID spelled other than canonically (here with a slash the node's
+    /// router would drop) is refused before anything is claimed, so it can
+    /// never reach the operator's pin of the canonical spelling.
+    func testANonCanonicalCIDIsRefused() async throws {
+        let fake = FakeNode()
+        fake.pins = [cidOf("mine")]
+        fake.held = [cidOf("mine"): volume("mine", 20).entries!]
+        let clock = Clock()
+        let seller = try await seller(fake, clock)
+        await seller.pay(root: cidOf("a"), value: coins(1))
+        for spelling in [cidOf("mine") + "/", "/" + cidOf("mine"), "!"] {
+            do {
+                _ = try await seller.store(root: cidOf("a"), volumes: [volume("a", 10), StorageNode.Volume(cid: spelling)])
+                XCTFail("\(spelling) is not canonical")
+            } catch {
+                XCTAssertEqual(error as? SponsorRefusal, .draft("a Volume's CID is not canonical"))
+            }
+        }
+        XCTAssertEqual(names(fake.pins), ["mine"])
+        XCTAssertEqual(fake.unpinned, [])
     }
 
     /// A Volume the node already holds is sized by the node's bytes, not
     /// the uploader's: the node ignores entries given for it.
     func testAHeldVolumeIsSizedByTheNodesBytes() async throws {
         let fake = FakeNode()
-        fake.held = ["big": volume("big", 90).entries!]
+        fake.held = [cidOf("big"): volume("big", 90).entries!]
         let clock = Clock()
         let seller = try await seller(fake, clock, budget: 100, largestGroup: 100)
-        await seller.pay(root: "a", value: coins(1))
+        await seller.pay(root: cidOf("a"), value: coins(1))
         let a = try await seller.store(
-            root: "a", volumes: [volume("a", 10), StorageNode.Volume(cid: "big", entries: ["big": Data()])]
+            root: cidOf("a"), volumes: [volume("a", 10), StorageNode.Volume(cid: cidOf("big"), entries: [cidOf("big"): Data()])]
         )
         XCTAssertEqual(a.bytes, 100)
-        XCTAssertEqual(fake.pins, ["a", "big"])
+        XCTAssertEqual(names(fake.pins), ["a", "big"])
 
-        await seller.pay(root: "b", value: coins(0.5))
+        await seller.pay(root: cidOf("b"), value: coins(0.5))
         do {
-            let b = [StorageNode.Volume(cid: "b", entries: ["b": Data("b".utf8)]), StorageNode.Volume(cid: "big")]
-            _ = try await seller.store(root: "b", volumes: b)
+            let b = [StorageNode.Volume(cid: cidOf("b"), entries: [cidOf("b"): Data([1])]), StorageNode.Volume(cid: cidOf("big"))]
+            _ = try await seller.store(root: cidOf("b"), volumes: b)
             XCTFail("b's 91 bytes at half a coin rank below a's 100 at one")
         } catch {
             XCTAssertEqual(error as? SponsorRefusal, .outranked)
         }
-        XCTAssertEqual(fake.pins, ["a", "big"], "b's own pin is undone; big stays a's")
+        XCTAssertEqual(names(fake.pins), ["a", "big"], "b's own pin is undone; big stays a's")
     }
 
     /// A Volume a held group uses as the operator's, which the operator then
     /// unpinned, is pinned and claimed by the next group that lists it.
     func testAnOperatorVolumeTheOperatorDroppedIsPinnedAgain() async throws {
         let fake = FakeNode()
-        fake.pins = ["mine"]
-        fake.held = ["mine": volume("mine", 20).entries!]
+        fake.pins = [cidOf("mine")]
+        fake.held = [cidOf("mine"): volume("mine", 20).entries!]
         let clock = Clock()
         let seller = try await seller(fake, clock)
-        await seller.pay(root: "a", value: coins(1))
-        await seller.pay(root: "b", value: coins(1))
-        _ = try await seller.store(root: "a", volumes: [volume("a", 10), StorageNode.Volume(cid: "mine")])
-        fake.pins.remove("mine")
-        _ = try await seller.store(root: "b", volumes: [volume("b", 10), StorageNode.Volume(cid: "mine")])
-        XCTAssertEqual(fake.pins, ["a", "b", "mine"])
+        await seller.pay(root: cidOf("a"), value: coins(1))
+        await seller.pay(root: cidOf("b"), value: coins(1))
+        _ = try await seller.store(root: cidOf("a"), volumes: [volume("a", 10), StorageNode.Volume(cid: cidOf("mine"))])
+        fake.pins.remove(cidOf("mine"))
+        _ = try await seller.store(root: cidOf("b"), volumes: [volume("b", 10), StorageNode.Volume(cid: cidOf("mine"))])
+        XCTAssertEqual(names(fake.pins), ["a", "b", "mine"])
         let claimed = await seller.ledger.state.claimed
-        XCTAssertEqual(claimed, ["a", "b", "mine"])
+        XCTAssertEqual(names(claimed), ["a", "b", "mine"])
     }
 
     /// Stores wait their turn instead of being refused.
@@ -263,10 +331,10 @@ final class StorageCreditTests: XCTestCase {
         let fake = FakeNode()
         let clock = Clock()
         let seller = try await seller(fake, clock)
-        await seller.pay(root: "a", value: coins(1))
-        await seller.pay(root: "b", value: coins(1))
-        async let a = seller.store(root: "a", volumes: [volume("a", 10)])
-        async let b = seller.store(root: "b", volumes: [volume("b", 10)])
+        await seller.pay(root: cidOf("a"), value: coins(1))
+        await seller.pay(root: cidOf("b"), value: coins(1))
+        async let a = seller.store(root: cidOf("a"), volumes: [volume("a", 10)])
+        async let b = seller.store(root: cidOf("b"), volumes: [volume("b", 10)])
         let (heldA, heldB) = try await (a.held, b.held)
         XCTAssertTrue(heldA && heldB)
     }
@@ -284,32 +352,32 @@ final class StorageCreditTests: XCTestCase {
                 return error as? SponsorRefusal
             }
         }
-        let unfunded = await refusal("a", [volume("a", 10)])
+        let unfunded = await refusal(cidOf("a"), [volume("a", 10)])
         XCTAssertEqual(unfunded, .unfunded, "nothing is pinned before work pays for it")
-        await seller.pay(root: "a", value: coins(1))
-        let tooBig = await refusal("a", [volume("a", 201)])
+        await seller.pay(root: cidOf("a"), value: coins(1))
+        let tooBig = await refusal(cidOf("a"), [volume("a", 201)])
         XCTAssertEqual(tooBig, .groupTooBig)
-        let neverFits = await refusal("a", [volume("a", 101)])
+        let neverFits = await refusal(cidOf("a"), [volume("a", 101)])
         XCTAssertEqual(neverFits, .neverFits)
-        let missing = await refusal("a", [volume("a", 10), StorageNode.Volume(cid: "gone")])
+        let missing = await refusal(cidOf("a"), [volume("a", 10), StorageNode.Volume(cid: cidOf("gone"))])
         XCTAssertEqual(missing, .volumeUnavailable)
-        let huge = StorageNode.Volume(cid: "a", entries: ["a": Data(count: StorageNode.largestBody)])
-        let tooBigToPin = await refusal("a", [huge])
+        let huge = StorageNode.Volume(cid: cidOf("a"), entries: [cidOf("a"): Data(count: StorageNode.largestBody)])
+        let tooBigToPin = await refusal(cidOf("a"), [huge])
         XCTAssertEqual(tooBigToPin, .volumeTooBig, "past the node's body limit")
-        let rootless = await refusal("a", [volume("b", 10)])
+        let rootless = await refusal(cidOf("a"), [volume("b", 10)])
         XCTAssertEqual(rootless, .draft("volumes lists each Volume once, the root among them"))
 
         // The node refuses the second Volume's bytes: the first is unpinned
         // again, and the group is not held.
-        let bad = StorageNode.Volume(cid: "bad", entries: ["bad": Data(count: 10)])
-        let badBytes = await refusal("a", [volume("a", 10), bad])
+        let bad = StorageNode.Volume(cid: cidOf("bad"), entries: [cidOf("bad"): Data(count: 10)])
+        let badBytes = await refusal(cidOf("a"), [volume("a", 10), bad])
         XCTAssertEqual(badBytes, .badVolume)
-        XCTAssertEqual(fake.pins, [])
-        XCTAssertEqual(fake.unpinned.suffix(2), ["a", "bad"])
-        let a = await seller.status("a")
+        XCTAssertEqual(names(fake.pins), [])
+        XCTAssertEqual(fake.unpinned.suffix(2).map(nameOf), ["a", "bad"])
+        let a = await seller.status(cidOf("a"))
         XCTAssertFalse(a.held)
         let claimed = await seller.ledger.state.claimed
-        XCTAssertEqual(claimed, [])
+        XCTAssertEqual(names(claimed), [])
     }
 
     /// The ledger survives a restart, and on boot is matched to the node: a
@@ -318,12 +386,12 @@ final class StorageCreditTests: XCTestCase {
         let fake = FakeNode()
         let clock = Clock()
         let first = try await seller(fake, clock)
-        await first.pay(root: "a", value: coins(1))
-        await first.pay(root: "b", value: coins(2))
-        _ = try await first.store(root: "a", volumes: [volume("a", 10), volume("shared", 10)])
-        _ = try await first.store(root: "b", volumes: [volume("b", 10), volume("shared", 10)])
-        await first.pay(root: "b", value: coins(1))
-        await first.pay(root: "unheld", value: coins(1))
+        await first.pay(root: cidOf("a"), value: coins(1))
+        await first.pay(root: cidOf("b"), value: coins(2))
+        _ = try await first.store(root: cidOf("a"), volumes: [volume("a", 10), volume("shared", 10)])
+        _ = try await first.store(root: cidOf("b"), volumes: [volume("b", 10), volume("shared", 10)])
+        await first.pay(root: cidOf("b"), value: coins(1))
+        await first.pay(root: cidOf("unheld"), value: coins(1))
         clock.now = 10
         await first.maintain()
         let saved = await first.ledger.state
@@ -331,22 +399,22 @@ final class StorageCreditTests: XCTestCase {
         let restarted = try await seller(fake, clock)
         let state = await restarted.ledger.state
         XCTAssertEqual(state, saved)
-        let b = await restarted.status("b")
+        let b = await restarted.status(cidOf("b"))
         XCTAssertEqual(b.credit, 3 * exp2(-0.01), accuracy: 1e-9)
         XCTAssertTrue(b.held)
 
         // b's own Volume went from the node while the sponsor was down.
-        fake.pins.remove("b")
+        fake.pins.remove(cidOf("b"))
         let reconciled = try await seller(fake, clock)
-        let held = await reconciled.ledger.state.groups.keys.sorted()
+        let held = await names(Set(reconciled.ledger.state.groups.keys))
         XCTAssertEqual(held, ["a"])
-        XCTAssertEqual(fake.pins, ["a", "shared"], "a still uses shared")
-        await reconciled.pay(root: "c", value: coins(1))
-        let c = try await reconciled.store(root: "c", volumes: [volume("c", 10)])
+        XCTAssertEqual(names(fake.pins), ["a", "shared"], "a still uses shared")
+        await reconciled.pay(root: cidOf("c"), value: coins(1))
+        let c = try await reconciled.store(root: cidOf("c"), volumes: [volume("c", 10)])
         XCTAssertTrue(c.held)
         let reloaded = try StorageLedger.load(from: file)
-        XCTAssertEqual(reloaded.groups.keys.sorted(), ["a", "c"])
-        XCTAssertEqual(reloaded.claimed, ["a", "c", "shared"])
+        XCTAssertEqual(names(Set(reloaded.groups.keys)), ["a", "c"])
+        XCTAssertEqual(names(reloaded.claimed), ["a", "c", "shared"])
     }
 
     /// Credit for a root not held expires as fee credit does; a held one's

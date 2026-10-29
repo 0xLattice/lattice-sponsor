@@ -434,7 +434,7 @@ actor Sponsor {
         let store = storage == nil ? nil : store
         if let store {
             guard peer == nil else { throw SponsorRefusal.draft("work buys serving or storage, not both") }
-            guard !store.isEmpty, store.utf8.count <= 256 else { throw SponsorRefusal.draft("store out of range") }
+            guard CIDIdentity.isCanonical(store) else { throw SponsorRefusal.draft("store is not a canonical CID") }
             guard pay == 0 else { throw SponsorRefusal.draft("storage work pays nothing") }
             // One chain's coins, so credit per byte compares across groups.
             guard chainPath == [DEFAULT_ROOT_DIRECTORY] else {

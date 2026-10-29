@@ -15,6 +15,7 @@ import Foundation
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
+import Lattice
 import UInt256
 
 /// The groups this sponsor holds, their credit, and the Volumes it claimed:
@@ -94,19 +95,38 @@ public struct StorageLedger: Sendable {
         let bytes = volumes.values.reduce(0, +)
         guard bytes <= largestGroup else { throw SponsorRefusal.groupTooBig }
         let operators = pinned.subtracting(state.claimed)
-        func cost(_ groups: [[String: Int]]) -> Int {
-            var sizes = volumes
-            for group in groups { sizes.merge(group) { first, _ in first } }
-            return sizes.filter { !operators.contains($0.key) }.values.reduce(0, +)
-        }
-        guard cost([]) <= budget else { throw SponsorRefusal.neverFits }
+        let cost = volumes.filter { !operators.contains($0.key) }.values.reduce(0, +)
+        guard cost <= budget else { throw SponsorRefusal.neverFits }
         let rank = Self.rank(credit, bytes)
-        var kept = state.groups.keys.sorted { (self.rank(of: $0, now: now), $0) < (self.rank(of: $1, now: now), $1) }
+        return try evictions(adding: volumes, operators: operators, now: now) { lowest in
+            guard lowest < rank else { throw SponsorRefusal.outranked }
+        }
+    }
+
+    /// The held groups to drop, lowest-ranked first, until they and
+    /// `volumes` fit the budget, each Volume counted once and an operator's
+    /// not at all. `check` sees each one's rank before it is dropped.
+    private func evictions(
+        adding volumes: [String: Int], operators: Set<String>, now: Int64, check: (Double) throws -> Void
+    ) rethrows -> [String] {
+        var uses: [String: Int] = [:]
+        var cost = 0
+        for group in [volumes] + Array(state.groups.values) {
+            for (volume, size) in group {
+                uses[volume, default: 0] += 1
+                if uses[volume] == 1, !operators.contains(volume) { cost += size }
+            }
+        }
+        let ranks = state.groups.keys.map { (rank: rank(of: $0, now: now), root: $0) }.sorted { $0 < $1 }
         var evict: [String] = []
-        while cost(kept.map { state.groups[$0]! }) > budget {
-            let lowest = kept.removeFirst()
-            guard self.rank(of: lowest, now: now) < rank else { throw SponsorRefusal.outranked }
-            evict.append(lowest)
+        for (rank, root) in ranks {
+            guard cost > budget else { break }
+            try check(rank)
+            for (volume, size) in state.groups[root]! {
+                uses[volume]! -= 1
+                if uses[volume] == 0, !operators.contains(volume) { cost -= size }
+            }
+            evict.append(root)
         }
         return evict
     }
@@ -144,16 +164,7 @@ public struct StorageLedger: Sendable {
     public mutating func reconcile(pinned: Set<String>, now: Int64) {
         state.claimed.formIntersection(pinned)
         state.groups = state.groups.filter { $0.value.keys.allSatisfy(pinned.contains) }
-        let operators = pinned.subtracting(state.claimed)
-        func cost() -> Int {
-            var sizes: [String: Int] = [:]
-            for group in state.groups.values { sizes.merge(group) { first, _ in first } }
-            return sizes.filter { !operators.contains($0.key) }.values.reduce(0, +)
-        }
-        var ranked = state.groups.keys.sorted { (rank(of: $0, now: now), $0) < (rank(of: $1, now: now), $1) }
-        while cost() > budget, !ranked.isEmpty {
-            state.groups.removeValue(forKey: ranked.removeFirst())
-        }
+        drop(evictions(adding: [:], operators: pinned.subtracting(state.claimed), now: now) { _ in })
     }
 
     /// Drop credit for roots not held once it outlives `creditLifetime`.
@@ -348,11 +359,16 @@ public actor StorageSeller {
     /// node's `POST /pins`. Every Volume's bytes are the node's, read back
     /// with `GET /fetch`, never the uploader's word.
     public func store(root: String, volumes: [StorageNode.Volume]) async throws -> Status {
-        guard volumes.contains(where: { $0.cid == root }), Set(volumes.map(\.cid)).count == volumes.count,
-              volumes.allSatisfy({ !$0.cid.isEmpty && $0.cid.utf8.count <= 256 }) else {
+        guard volumes.allSatisfy({ CIDIdentity.isCanonical($0.cid) }) else {
+            throw SponsorRefusal.draft("a Volume's CID is not canonical")
+        }
+        guard volumes.contains(where: { $0.cid == root }), Set(volumes.map(\.cid)).count == volumes.count else {
             throw SponsorRefusal.draft("volumes lists each Volume once, the root among them")
         }
         guard reconciled else { throw SponsorRefusal.busy }
+        // Only a funded root waits its turn; checked again once it comes.
+        if ledger.isHeld(root) { return status(root) }
+        guard ledger.credit(of: root, now: now()) > 0 else { throw SponsorRefusal.unfunded }
         await lock()
         defer { unlock() }
         if ledger.isHeld(root) { return status(root) }
@@ -443,7 +459,7 @@ public actor StorageSeller {
     }
 
     /// Unpin each claimed Volume no held group uses; one the node does not
-    /// unpin stays claimed, for the next pass.
+    /// unpin stays claimed, for the next pass, and holds up no other.
     private func unpinOrphans() async {
         for volume in ledger.orphans {
             do {
@@ -452,7 +468,6 @@ public actor StorageSeller {
                 dirty = true
             } catch {
                 print("unpin \(volume) failed: \(error)")
-                return
             }
         }
     }

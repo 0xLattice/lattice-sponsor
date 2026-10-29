@@ -117,7 +117,8 @@ pinned with the bytes given, or else read with the node's `GET /fetch`, and
 the node's `POST /pins` checks every entry against its CID. A Volume it
 refuses is `badVolume`, and nothing of the group stays pinned. A group's
 bytes are the node's, read back with `GET /fetch`. A root with no credit is
-`unfunded`. Stores run one at a time, in turn.
+`unfunded`, and every CID must be spelled canonically. Stores run one at a
+time, in turn.
 
 Credit halves every half-life, and paying again for a held group raises it.
 Held groups are ranked by credit per byte: one that does not fit the budget
