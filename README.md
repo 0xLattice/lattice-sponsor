@@ -40,10 +40,12 @@ lattice-sponsor \
   template's height; at 0 it pays fees only.
 
 - `--sell-serving` lets work buy serving balance on the node instead of fee
-  credit (see [Serving credit](#serving-credit)).
+  credit (see [Serving credit](#serving-credit)), at `--serving-rate`.
 - `--sell-storage` lets work buy a permanent pin for a file (see
   [Storage](#storage)), with `--storage-budget`, `--storage-rate` and
   `--storage-file`.
+- `--pay-to` lets coin buy either too (see [Paying in coin](#paying-in-coin)),
+  with `--coin-depth`.
 
 Credit is held in memory, so a restart forfeits unspent shares, and serving
 bytes not yet posted to the node. A chain's
@@ -66,6 +68,8 @@ JSON; 64-bit integers are decimal strings, and targets and work are hex.
 | `POST /sponsor` | `{client, transaction, pay?}` | the co-signed transaction |
 | `POST /store` | `{root, volumes: [{cid, entries?, bytes?}]}` | `{root, bytes, needed, credit, stored}` |
 | `GET /store/:root` | | `{root, bytes, needed, credit, stored}` |
+| `POST /pay` | `{chain, txCID, signer, signature, peer?, store?}` | `{bytes}` bought |
+| `GET /terms` | | `{payTo, depth, servingRates, storageRates}` |
 
 With a `pay`, the sponsor credits the client `pay` within the transaction, and
 debits itself the fee plus `pay`. The client's own debits net against that
@@ -80,10 +84,10 @@ paid here buys that priority, never access itself.
 
 With `--sell-serving`, a reader advertises its Ivy peer ID as `peer` on
 `POST /work`. Its shares on that assignment are valued as for a fee, in the
-chain's smallest unit, then multiplied by the node's `bytesPerCoin` for the
-chain (from its `GET /serving-terms`), rounded down. At each refresh the
+chain's smallest unit, then multiplied by the chain's
+`--serving-rate <chain>=<bytesPerCoin>`, rounded down. At each refresh the
 sponsor posts each peer's whole bytes to the node's `POST /serving-balance`,
-with the RPC cookie. A chain the node sets no rate for is refused
+with the RPC cookie. A chain without a rate is refused
 (`noServingRate`); without the flag a `peer` is ignored and the work is fee
 work. Bytes the node does not take (it is down, failing or refusing the
 sponsor) stay owed and are posted later; a peer the node refuses (400, 422)
@@ -120,6 +124,29 @@ against its CID, and adds `{root, bytes}` to `--storage-file`. Nothing is
 ever unpinned. An upload not yet paid is held in memory for an hour, and a
 paid one until it is pinned; a restart forfeits either, with its credit, as it
 does fee credit.
+
+## Paying in coin
+
+With `--pay-to <address>`, a reader or uploader can pay in coin instead of
+work, at the same `--serving-rate` and `--storage-rate`. It sends coins to
+that address on a chain with a rate, then, once the transaction is
+`--coin-depth` (default 6) blocks below the tip of the node's canonical chain,
+claims it with `POST /pay`, naming exactly one of `peer` (with
+`--sell-serving`) or `store` (an upload held with `--sell-storage`).
+`signer` is one of the transaction's signers, and `signature` its
+`CryptoUtils.sign` signature over
+`lattice-sponsor-pay:v1:<chain>:<txCID>:<peer or store>`.
+
+What the transaction pays `--pay-to` on that chain, net, times the rate, is
+added to the peer's serving balance or to the upload's credit, which pins it
+once paid. Each transaction is credited once; the ones credited are kept in
+`lattice-sponsor-payments.json` beside `--storage-file`. Refusals are named:
+`notIncluded` (404), `notDeepEnough` (425, retry later), `notSigner`,
+`invalidSignature`, `noPayment`, `alreadyCredited` (409). The sponsor reads
+the transaction through the node's `GET /api/transaction`, `GET /api/block`
+and `GET /transactions` routes, so the node keeps every state and block body
+(`--state all --block-bodies all`). `GET /terms` publishes `payTo`, `depth`
+and both rates.
 
 ## What it risks
 

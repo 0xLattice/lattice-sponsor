@@ -1,8 +1,8 @@
 // Serving credit: work that buys a reader priority on the node's serving
-// instead of fee credit. The node sells serving by the byte, per peer, at a
-// rate in bytes per coin (the chain's smallest unit) of each chain it names. A reader's share is
-// valued as for a fee (its chance of that chain's block, times its reward),
-// converted at the chain's rate, and posted to the node as the peer's serving
+// instead of fee credit. The sponsor sells serving by the byte, per peer, at a
+// rate in bytes per coin (the chain's smallest unit) of each chain it names
+// (--serving-rate). A reader's share is valued as for a fee (its chance of
+// that chain's block, times its reward), converted at the chain's rate, and posted to the node as the peer's serving
 // balance, a batch per peer at each refresh.
 
 import Foundation
@@ -13,8 +13,8 @@ import UInt256
 
 /// The serving bytes the sponsor owes each peer, not yet posted to the node.
 public struct ServingLedger: Sendable {
-    /// Bytes per coin (the chain's smallest unit) on each chain, from the
-    /// node's `/serving-terms`.
+    /// Bytes per coin (the chain's smallest unit) on each chain, from
+    /// --serving-rate.
     public private(set) var rates: [[String]: Int] = [:]
     /// How long what is under a byte outlives the peer's last share.
     public let lifetime: Int64
@@ -79,8 +79,9 @@ public struct ServingLedger: Sendable {
     }
 }
 
-/// The node's serving routes: its terms, a public read, and the peer's
-/// serving balance, written on the cookie-authenticated operator surface.
+/// The node's routes: a peer's serving balance, written on the
+/// cookie-authenticated operator surface, and the reads and pins of storage
+/// and coin payment.
 public struct ServingNode: Sendable {
     public typealias Send = @Sendable (URLRequest) async throws -> (Data, URLResponse)
 
@@ -100,19 +101,6 @@ public struct ServingNode: Sendable {
 
     public enum Failure: Error, Equatable {
         case status(Int)
-    }
-
-    /// Bytes per coin on each chain the node sells serving on.
-    public func rates() async throws -> [[String]: Int] {
-        struct Terms: Decodable {
-            struct Rate: Decodable { let bytesPerCoin: Int }
-            let rates: [String: Rate]
-        }
-        let terms = try JSONDecoder().decode(Terms.self, from: try await call(request("serving-terms")))
-        return Dictionary(
-            terms.rates.map { ($0.key.components(separatedBy: "/"), $0.value.bytesPerCoin) },
-            uniquingKeysWith: { first, _ in first }
-        )
     }
 
     /// Add `bytes` to `peer`'s serving balance.

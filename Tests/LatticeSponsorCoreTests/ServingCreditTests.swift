@@ -8,17 +8,13 @@ import UInt256
 
 private let market = ["Nexus", "Market"]
 
-/// The node's serving routes, in memory: `/serving-terms` and the
-/// operator's `/serving-balance`.
+/// The node's operator route `/serving-balance`, in memory.
 private final class FakeNode: @unchecked Sendable {
     private let lock = NSLock()
     private var _down = false
     private var _posts: [(peer: String, bytes: Int, authorization: String?)] = []
     /// Peers the node answers with a status other than 200.
     var failing: [String: Int] = [:]
-    let terms: String
-
-    init(terms: String) { self.terms = terms }
 
     var down: Bool {
         get { locked { _down } }
@@ -46,8 +42,6 @@ private final class FakeNode: @unchecked Sendable {
             (Data(body.utf8), HTTPURLResponse(url: url, statusCode: status, httpVersion: nil, headerFields: nil)!)
         }
         switch (request.httpMethod ?? "GET", url.path) {
-        case ("GET", "/serving-terms"):
-            return respond(200, terms)
         case ("POST", "/serving-balance"):
             struct Body: Decodable { let peer: String; let bytes: Int }
             let body = try JSONDecoder().decode(Body.self, from: request.httpBody ?? Data())
@@ -62,10 +56,6 @@ private final class FakeNode: @unchecked Sendable {
         }
     }
 }
-
-private let terms = """
-    {"payTo":null,"rates":{"Nexus/Market":{"bytesPerCoin":3},"Nexus":{"bytesPerCoin":0}},"depth":2,"workURL":null}
-    """
 
 final class ServingCreditTests: XCTestCase {
     /// A share on Market is 10/16 of a coin (as in `SponsorLedgerTests`);
@@ -82,11 +72,6 @@ final class ServingCreditTests: XCTestCase {
             expiresAt: 30_000
         ), now: 0)
         return ledger
-    }
-
-    func testTheNodesTermsAreBytesPerCoinByChainPath() async throws {
-        let rates = try await FakeNode(terms: terms).node.rates()
-        XCTAssertEqual(rates, [market: 3, ["Nexus"]: 0])
     }
 
     /// A share's value converts at the chain's rate and rounds down to whole
@@ -142,7 +127,7 @@ final class ServingCreditTests: XCTestCase {
     /// Bytes the node does not take while it is down stay owed and are posted
     /// once it is back; a peer the node refuses is dropped.
     func testBytesAreRetriedWhileTheNodeIsDown() async throws {
-        let fake = FakeNode(terms: terms)
+        let fake = FakeNode()
         var serving = ServingLedger()
         serving.install(rates: [market: 3])
         for peer in ["a", "b"] {
@@ -168,7 +153,7 @@ final class ServingCreditTests: XCTestCase {
     /// A peer the node refuses (422) is dropped and one it fails on (5xx) is
     /// kept, and neither holds up the others.
     func testOnePeersFailureHoldsUpNoOther() async throws {
-        let fake = FakeNode(terms: terms)
+        let fake = FakeNode()
         fake.failing = ["refused": 422, "failing": 500]
         let unposted = await fake.node.post(["refused": 5, "failing": 6, "a": 7])
         XCTAssertEqual(unposted, ["failing": 6])
@@ -177,7 +162,7 @@ final class ServingCreditTests: XCTestCase {
 
     /// An answer about the sponsor, not the peer (here 401), drops nothing.
     func testAnUnauthorizedPostKeepsEveryPeer() async throws {
-        let fake = FakeNode(terms: terms)
+        let fake = FakeNode()
         fake.failing = ["a": 401, "b": 401]
         let unposted = await fake.node.post(["a": 5, "b": 6])
         XCTAssertEqual(unposted, ["a": 5, "b": 6])

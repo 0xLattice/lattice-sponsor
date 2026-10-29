@@ -116,8 +116,8 @@ public enum SponsorRefusal: Error, Sendable, Equatable {
     case unpriceable
     /// The draft is not one the sponsor signs; the reason names why.
     case draft(String)
-    /// The node sets no serving rate on the chain, so work there buys no
-    /// serving balance.
+    /// The sponsor sets no serving rate on the chain, so work or coin there
+    /// buys no serving balance.
     case noServingRate
     /// The sponsor sets no storage rate on the chain.
     case noStorageRate
@@ -125,6 +125,18 @@ public enum SponsorRefusal: Error, Sendable, Equatable {
     case overBudget
     /// No upload is held under that root: it expired, or was never made.
     case unknownUpload
+    /// The transaction is not in the node's canonical chain.
+    case notIncluded
+    /// Too few blocks are built on the transaction's block yet; retry later.
+    case notDeepEnough
+    /// The claimed signer did not sign the transaction.
+    case notSigner
+    /// The signature is not the signer's over the claim.
+    case invalidSignature
+    /// The transaction pays the sponsor's account nothing, net.
+    case noPayment
+    /// The transaction is already credited, or being checked.
+    case alreadyCredited
 }
 
 public struct SponsorLedger: Sendable {
