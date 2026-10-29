@@ -9,22 +9,27 @@ import UInt256
 private let market = ["Nexus", "Market"]
 private let peer = String(repeating: "ab", count: 32)
 
+private struct Post: Decodable, Equatable {
+    let peer: String
+    let bytes: Int
+}
+
 /// The node's `POST /serving-credit`, answering `status`, recording each body.
 private final class FakeServing: @unchecked Sendable {
     private let lock = NSLock()
-    private var _posts: [[String: AnyHashable]] = []
+    private var _posts: [Post] = []
     let status: Int
 
     init(status: Int = 200) { self.status = status }
 
-    var posts: [[String: AnyHashable]] { lock.withLock { _posts } }
+    var posts: [Post] { lock.withLock { _posts } }
 
     var node: SponsorNode {
         SponsorNode(base: URL(string: "http://127.0.0.1:8080")!, authorization: { "Basic cookie" }) { request in
             XCTAssertEqual(request.httpMethod, "POST")
             XCTAssertEqual(request.url?.path, "/serving-credit")
             XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Basic cookie")
-            let body = try JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as! [String: AnyHashable]
+            let body = try JSONDecoder().decode(Post.self, from: request.httpBody ?? Data())
             self.lock.withLock { self._posts.append(body) }
             let answer = Data(#"{"peer":"\#(peer)","standing":1}"#.utf8)
             return (answer, HTTPURLResponse(url: request.url!, statusCode: self.status, httpVersion: nil, headerFields: nil)!)
@@ -49,7 +54,7 @@ final class ServingCreditTests: XCTestCase {
 
         let fake = FakeServing()
         try await fake.node.creditServing(peer: peer, bytes: try serving.bytes(for: value, on: market))
-        XCTAssertEqual(fake.posts, [["peer": peer, "bytes": 640]])
+        XCTAssertEqual(fake.posts, [Post(peer: peer, bytes: 640)])
 
         XCTAssertEqual(try serving.bytes(for: SponsorLedger.unit / UInt256(1025), on: market), 0)
         try await fake.node.creditServing(peer: peer, bytes: 0)
@@ -60,7 +65,7 @@ final class ServingCreditTests: XCTestCase {
     func testPayCreditsTheNode() async throws {
         let fake = FakeServing()
         try await fake.node.creditServing(peer: peer, bytes: try serving.bytes(for: UInt256(4) * SponsorLedger.unit, on: market))
-        XCTAssertEqual(fake.posts, [["peer": peer, "bytes": 4096]])
+        XCTAssertEqual(fake.posts, [Post(peer: peer, bytes: 4096)])
 
         let store = CoinPayment(chain: "Nexus/Market", txCID: "tx1", signer: "s", signature: "", store: "root")
         let served = CoinPayment(chain: "Nexus/Market", txCID: "tx1", signer: "s", signature: "", peer: peer)
