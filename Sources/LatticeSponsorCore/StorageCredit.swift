@@ -4,8 +4,8 @@
 // Once paid, the sponsor pins every Volume on its node, which checks each
 // against its CID, and keeps it forever: nothing is ever unpinned. The roots
 // stored, and their bytes, are kept in one JSON file, which counts the budget
-// across restarts. An upload not yet pinned is held in memory, for at most
-// `lifetime`; a restart forfeits it.
+// across restarts. An upload not yet paid is held in memory for at most
+// `lifetime`, and a paid one until it is pinned; a restart forfeits either.
 
 import Foundation
 #if canImport(FoundationNetworking)
@@ -49,6 +49,9 @@ public struct StorageLedger: Sendable {
     /// How long an upload not yet pinned is held.
     public let lifetime: Int64
     let file: URL
+    /// The most bytes in one Volume: its pin, base64-encoded, must fit the
+    /// node's 2 MiB request body.
+    public static let largestVolume = 1 << 20
 
     public struct Upload: Sendable {
         public let volumes: [StoreVolume]
@@ -102,6 +105,9 @@ public struct StorageLedger: Sendable {
         for volume in volumes {
             var size = 0
             if let entries = volume.entries {
+                // A Volume the node already holds is pinned as held, its
+                // entries ignored, so it must at least carry its own root.
+                guard entries[volume.cid] != nil else { throw SponsorRefusal.draft("a Volume's entries lack its root") }
                 for value in entries.values {
                     guard let data = Data(base64Encoded: value) else { throw SponsorRefusal.draft("entries are not base64") }
                     size += data.count
@@ -112,6 +118,8 @@ public struct StorageLedger: Sendable {
                 }
                 size = declared
             }
+            // The node takes a `POST /pins` body of at most 2 MiB.
+            guard size <= Self.largestVolume else { throw SponsorRefusal.draft("a Volume is over 1 MiB") }
             let (sum, overflow) = bytes.addingReportingOverflow(size)
             guard !overflow else { throw SponsorRefusal.overBudget }
             bytes = sum
@@ -177,9 +185,12 @@ public struct StorageLedger: Sendable {
         return StoreStatus(root: root, bytes: upload.bytes, needed: needed, credit: credit, stored: false)
     }
 
-    /// Drop uploads held past `lifetime`, except one being pinned.
+    /// Drop uploads held past `lifetime`, except one paid in full: some of
+    /// its Volumes may be pinned already, so it keeps its bytes reserved.
     private mutating func sweep(now: Int64) {
-        pending = pending.filter { $0.value.pinning || now - $0.value.created < lifetime }
+        pending = pending.filter {
+            $0.value.paid >= UInt256(UInt64($0.value.bytes)) * SponsorLedger.unit || now - $0.value.created < lifetime
+        }
     }
 }
 

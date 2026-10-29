@@ -105,7 +105,8 @@ trusts the host for availability only: bytes are checked by CID.
 With `--sell-storage`, an uploader sends `POST /store` with the file's root
 and every Volume in it, root included. A Volume carries its `entries` (CID to
 base64 bytes, as the node's `POST /pins` takes), or only its declared `bytes`,
-to be read later with the node's `GET /fetch` (and refused if larger). An
+to be read later with the node's `GET /fetch` (and refused if larger). A
+Volume's entries include its root, and a Volume is at most 1 MiB. An
 upload that does not fit in what is left of `--storage-budget` is refused
 (`overBudget`). The answer's `needed` is the coins of work still owed on each
 chain `--storage-rate <chain>=<bytesPerCoin>` prices; `credit` is the bytes
@@ -116,8 +117,9 @@ storage rate (otherwise `noStorageRate`), and posts shares as usual. Storage
 credit pays no fee, serving or `pay`. Once it covers the upload's bytes, the
 sponsor pins every Volume with the node's `POST /pins`, which checks each
 against its CID, and adds `{root, bytes}` to `--storage-file`. Nothing is
-ever unpinned. An upload not yet pinned is held in memory for an hour, and a
-restart forfeits it, with its credit, as it does fee credit.
+ever unpinned. An upload not yet paid is held in memory for an hour, and a
+paid one until it is pinned; a restart forfeits either, with its credit, as it
+does fee credit.
 
 ## What it risks
 

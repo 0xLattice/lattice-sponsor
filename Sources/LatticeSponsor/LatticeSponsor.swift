@@ -35,8 +35,8 @@
 //
 // With --sell-storage, work naming an upload's root as `store` pays for it at
 // --storage-rate bytes per coin; once paid, every Volume is pinned on the
-// node for good. Unpaid uploads are held in memory for an hour, and a restart
-// forfeits them; the roots pinned are kept in --storage-file.
+// node for good. Unpaid uploads are held in memory for an hour, paid ones until
+// pinned, and a restart forfeits them; the roots pinned are kept in --storage-file.
 //
 // Routes (JSON, 64-bit integers as decimal strings, targets and work as hex):
 //   POST /work     {client?, chain?, pay?, peer?} → a nonce range of the template
