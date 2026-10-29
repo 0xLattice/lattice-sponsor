@@ -607,11 +607,11 @@ actor Sponsor {
         let chainPath = payment.chainPath
         // Refused before reading the node, and again after, since an upload
         // can expire meanwhile. Returns the chain's rate.
-        func check() throws -> Int {
+        func check(at now: Int64) throws -> Int {
             switch (payment.peer, payment.store) {
             case (nil, let store?):
                 guard let storage else { throw SponsorRefusal.unknownUpload }
-                try storage.check(root: store, on: chainPath, now: now())
+                try storage.check(root: store, on: chainPath, now: now)
                 return try storage.rate(on: chainPath)
             case (let peer?, nil):
                 guard servingNode != nil else { throw SponsorRefusal.noServingRate }
@@ -621,18 +621,20 @@ actor Sponsor {
                 throw SponsorRefusal.draft("name exactly one of peer or store")
             }
         }
-        _ = try check()
+        _ = try check(at: now())
         try payments!.claim(payment.txCID)
         do {
             let coins = try await pinNode.verify(payment, payTo: payTo, depth: coinDepth)
-            let rate = try check()
+            // One instant, so the credit below cannot fail once checked.
+            let at = now()
+            let rate = try check(at: at)
             try payments!.release(payment.txCID, credit: true)
             let value = UInt256(coins) * SponsorLedger.unit
             if let store = payment.store {
-                try storage!.credit(root: store, value: value, on: chainPath, now: now())
+                try storage!.credit(root: store, value: value, on: chainPath, now: at)
                 Task { await pinIfPaid(store) }
             } else if let peer = payment.peer {
-                try serving.credit(peer: peer, value: value, on: chainPath, now: now())
+                try serving.credit(peer: peer, value: value, on: chainPath, now: at)
             }
             let (bytes, overflow) = coins.multipliedReportingOverflow(by: UInt64(rate))
             return PayResponse(bytes: overflow ? .max : bytes)
@@ -647,7 +649,7 @@ actor Sponsor {
             Dictionary(uniqueKeysWithValues: rates.map { ($0.key.joined(separator: "/"), $0.value) })
         }
         return TermsResponse(
-            payTo: payTo, depth: coinDepth, servingRates: named(serving.rates),
+            payTo: payTo, depth: coinDepth, servingRates: named(servingNode == nil ? [:] : serving.rates),
             storageRates: named(storage?.rates ?? [:])
         )
     }
