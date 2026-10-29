@@ -27,8 +27,14 @@
 // the key's authority to the body, so the key must own nothing a draft could
 // reach. Credit is held in memory; a restart forfeits unspent shares.
 //
+// With --sell-serving, work naming a reader's Ivy peer buys serving balance
+// on the node instead of fee credit: each share's value on its chain, times
+// the node's bytes per coin there, posted to the node for that peer at each
+// few seconds. Owed bytes are held in memory too; a post the node does not
+// take is retried at the next one. Without the flag, a peer is ignored.
+//
 // Routes (JSON, 64-bit integers as decimal strings, targets and work as hex):
-//   POST /work     {client?, chain?, pay?}        → a nonce range of the template
+//   POST /work     {client?, chain?, pay?, peer?} → a nonce range of the template
 //   POST /shares   {assignment, nonce}            → the client's credit on its chain
 //   POST /sponsor  {client, transaction, pay?}    → the co-signed transaction
 //
@@ -76,6 +82,9 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
     @Option(name: .long, help: "The most coins to pay a client within one transaction, for its shares (default: the chain's block reward; 0: fees only).")
     var mostPay: UInt64?
 
+    @Flag(name: .long, help: "Sell serving: work naming a reader's peer buys serving balance on the node instead of fee credit.")
+    var sellServing = false
+
     @Option(name: .long, help: "Listen address.")
     var host: String = "127.0.0.1"
 
@@ -89,13 +98,16 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
         guard let base = URL(string: node) else { throw ValidationError("--node is not a URL") }
         let signer = try SponsorKey(file: key)
         let rpc = SponsorRPC(base: base, cookieFile: URL(fileURLWithPath: cookieFile))
+        let cookie = URL(fileURLWithPath: cookieFile)
         let sponsor = Sponsor(
             ledger: SponsorLedger(shareTarget: minimumWorkTarget(work)),
             rpc: rpc,
             key: signer,
             minimumFee: fee,
             mostPay: mostPay,
-            tokenKey: SymmetricKey(size: .bits256)
+            tokenKey: SymmetricKey(size: .bits256),
+            servingNode: sellServing
+                ? ServingNode(base: base, authorization: { rpcCookieAuthorization(file: cookie) }) : nil
         )
         let templates = HTTPMiningCoordinatorNodeClient(
             apiBaseURL: base, cookieFile: URL(fileURLWithPath: cookieFile)
@@ -119,6 +131,15 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
             }
         }
         defer { refresh.cancel() }
+        // Apart from the template refresh, so a slow node answering serving
+        // posts never lets the template expire under fee clients.
+        let servingPosts = Task {
+            while !Task.isCancelled {
+                await sponsor.postServing()
+                try? await Task.sleep(for: .seconds(5))
+            }
+        }
+        defer { servingPosts.cancel() }
 
         let router = Router()
         // Wallets call this from web pages. No cookie or credential rides on
@@ -127,7 +148,9 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
         router.post("work") { request, context in
             let input = try await request.decode(as: WorkRequest.self, context: context)
             return try await refusing {
-                try await sponsor.work(client: input.client, chainPath: input.chainPath, pay: input.pay ?? 0)
+                try await sponsor.work(
+                    client: input.client, chainPath: input.chainPath, pay: input.pay ?? 0, peer: input.peer
+                )
             }
         }
         router.post("shares") { request, context in
@@ -166,6 +189,9 @@ struct WorkRequest: Decodable {
     /// Coins the sponsor is to pay the client as well; `sharesForFee` then
     /// buys both.
     @OptionalDecimalString var pay: UInt64?
+    /// The reader's Ivy peer ID: its shares buy serving balance on the node
+    /// for that peer, not fee credit (with --sell-serving; ignored without).
+    let peer: String?
 
     var chainPath: [String] {
         (chain ?? DEFAULT_ROOT_DIRECTORY).components(separatedBy: "/")
@@ -183,7 +209,8 @@ struct WorkResponse: ResponseEncodable {
     @DecimalString var fee: UInt64
     /// What the sponsor pays the client as well, as asked.
     @DecimalString var pay: UInt64
-    /// Shares that buy `fee` and `pay` at the current price, saturating.
+    /// Shares that buy `fee` and `pay` at the current price, saturating
+    /// (zero, with `fee` and `pay`, for serving work).
     @DecimalString var sharesForFee: UInt64
     @DecimalString var expiresInMilliseconds: UInt64
 }
@@ -196,6 +223,9 @@ struct ShareRequest: Decodable {
 struct ShareResponse: ResponseEncodable {
     /// The client's credit on the assignment's chain, in whole units.
     @DecimalString var credit: UInt64
+    /// For serving work: the bytes the sponsor owes the peer and has not yet
+    /// posted to the node.
+    @OptionalDecimalString var bytes: UInt64?
 }
 
 struct SponsorRequest: Decodable {
@@ -230,10 +260,13 @@ actor Sponsor {
     /// refresh so a request reads nothing from the node.
     private var fees: [[String]: UInt64] = [:]
     private var balances: [[String]: UInt64] = [:]
+    /// The node's serving routes, with --sell-serving.
+    private let servingNode: ServingNode?
+    private var serving = ServingLedger()
 
     init(
         ledger: SponsorLedger, rpc: SponsorRPC, key: SponsorKey, minimumFee: UInt64, mostPay: UInt64?,
-        tokenKey: SymmetricKey
+        tokenKey: SymmetricKey, servingNode: ServingNode?
     ) {
         self.ledger = ledger
         self.rpc = rpc
@@ -241,6 +274,7 @@ actor Sponsor {
         self.minimumFee = minimumFee
         self.mostPay = mostPay
         self.tokenKey = tokenKey
+        self.servingNode = servingNode
     }
 
     /// Take `template` as the newest work, priced on every chain whose block
@@ -277,15 +311,27 @@ actor Sponsor {
         ), now: now())
     }
 
-    func work(client: String?, chainPath: [String], pay: UInt64) throws -> WorkResponse {
-        let fee = try currentFee(chainPath)
+    func work(client: String?, chainPath: [String], pay: UInt64, peer: String?) throws -> WorkResponse {
+        var fee: UInt64 = 0
+        var shares = UInt256.zero
+        // Without --sell-serving, a peer is ignored: the work is fee work.
+        let peer = servingNode == nil ? nil : peer
+        if let peer {
+            guard !peer.isEmpty, peer.utf8.count <= 256 else { throw SponsorRefusal.draft("peer out of range") }
+            guard pay == 0 else { throw SponsorRefusal.draft("serving work pays nothing") }
+            _ = try serving.rate(on: chainPath)
+        } else {
+            fee = try currentFee(chainPath)
+        }
         let total = try charge(fee: fee, pay: pay, on: chainPath)
         let client = try client.map { token in
             guard isIssued(token) else { throw SponsorRefusal.draft("unknown client token") }
             return token
         } ?? issueToken()
-        let assignment = try ledger.assign(client: client, on: chainPath, now: now())
-        let shares = ledger.sharesFor(fee: total, on: chainPath) ?? .max
+        let assignment = try ledger.assign(client: client, on: chainPath, peer: peer, now: now())
+        if peer == nil {
+            shares = ledger.sharesFor(fee: total, on: chainPath) ?? .max
+        }
         return WorkResponse(
             client: client,
             assignment: assignment.id,
@@ -310,9 +356,16 @@ actor Sponsor {
             midstate: ProofOfWork.midstate(prefixBytes: ContiguousArray(prefix)), nonce: nonce
         )
         let credited = Result { () throws -> ShareResponse in
-            let units = try ledger.credit(assignment: assignment, nonce: nonce, hash: hash, now: now())
-                / SponsorLedger.unit
-            return ShareResponse(credit: units > UInt256(UInt64.max) ? .max : UInt64(units.words[0]))
+            // A chain without a rate is refused before the share is spent.
+            if held.peer != nil { _ = try serving.rate(on: held.chainPath) }
+            let value = try ledger.credit(assignment: assignment, nonce: nonce, hash: hash, now: now())
+            var bytes: UInt64?
+            if let peer = held.peer {
+                try serving.credit(peer: peer, value: value, on: held.chainPath, now: now())
+                bytes = UInt64(serving.owed(to: peer))
+            }
+            let units = ledger.credit(of: held.client, on: held.chainPath) / SponsorLedger.unit
+            return ShareResponse(credit: units > UInt256(UInt64.max) ? .max : UInt64(units.words[0]), bytes: bytes)
         }
         return (credited, ledger.block(assignment: assignment, nonce: nonce, hash: hash, now: now()))
     }
@@ -341,6 +394,20 @@ actor Sponsor {
             fee: fee,
             pay: pay
         )
+    }
+
+    /// Read the node's serving rates, and post each peer's owed bytes; what
+    /// the node does not take stays owed for the next refresh.
+    func postServing() async {
+        guard let servingNode else { return }
+        do {
+            serving.install(rates: try await servingNode.rates())
+        } catch {
+            print("serving terms fetch failed: \(error)")
+        }
+        for (peer, bytes) in await servingNode.post(serving.take(now: now())) {
+            serving.restore(peer: peer, bytes: bytes, now: now())
+        }
     }
 
     /// What the sponsor spends for a fee and a payment, within --most-pay.
