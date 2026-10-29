@@ -370,7 +370,7 @@ public actor StorageSeller {
     /// checked and stored, or for one it held, read back with `GET /fetch`;
     /// never the uploader's word.
     public func store(root: String, volumes: [StorageNode.Volume]) async throws -> Status {
-        guard volumes.allSatisfy({ CIDIdentity.isCanonical($0.cid) }) else {
+        guard volumes.allSatisfy({ $0.cid.utf8.count <= 256 && CIDIdentity.isCanonical($0.cid) }) else {
             throw SponsorRefusal.draft("a Volume's CID is not canonical")
         }
         guard volumes.contains(where: { $0.cid == root }), Set(volumes.map(\.cid)).count == volumes.count else {
@@ -392,18 +392,17 @@ public actor StorageSeller {
             // A Volume the node pins that this sponsor did not claim is the
             // operator's: used, never claimed. One the operator pins after
             // this read and before the pin below is claimed: the node's pins
-            // name no owner. Claims are on disk before any pin lands.
-            let toPin = volumes.filter { !pinned.contains($0.cid) || ledger.state.claimed.contains($0.cid) }
-            for volume in toPin { ledger.claim(volume.cid) }
-            dirty = true
-            save()
+            // name no owner. Each claim is on disk before its pin lands.
             for volume in volumes {
                 if pinned.contains(volume.cid), let known = ledger.size(of: volume.cid) {
                     sizes[volume.cid] = known
                     continue
                 }
                 var entries: [String: Data]?
-                if toPin.contains(where: { $0.cid == volume.cid }) {
+                if !pinned.contains(volume.cid) || ledger.state.claimed.contains(volume.cid) {
+                    ledger.claim(volume.cid)
+                    dirty = true
+                    save()
                     entries = try await fromNode {
                         try await node.pin(volume.cid) {
                             if let entries = volume.entries { return entries }
@@ -467,7 +466,8 @@ public actor StorageSeller {
     /// The node's pins. An empty answer while this sponsor holds claims is
     /// taken as the node's failure (it answers an unreadable store as no
     /// pins): taken at its word, the sponsor would claim the operator's pins,
-    /// or forget its own.
+    /// or forget its own. With no claims, an empty answer cannot be told
+    /// from a failed read.
     private func pins() async throws -> Set<String> {
         let pinned = try await fromNode { try await node.pins() }
         guard !pinned.isEmpty || ledger.state.claimed.isEmpty else {

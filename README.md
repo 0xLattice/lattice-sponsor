@@ -46,7 +46,7 @@ lattice-sponsor \
   most `--storage-largest-group` bytes a group (16 MiB), with credit halving
   every `--storage-half-life` seconds (a week) and `POST /store` bodies of at
   most `--storage-largest-upload` bytes (32 MiB). Its state is kept in
-  `--storage-state` (`sponsor-storage.json`).
+  `--storage-state` (`sponsor-storage.json`), which must be writable.
 
 Credit is held in memory, so a restart forfeits unspent shares, and serving
 bytes not yet posted to the node; storage credit is kept on disk. A chain's

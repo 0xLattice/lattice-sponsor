@@ -250,13 +250,20 @@ extension LatticeSponsorCommand {
             throw ValidationError("the --storage- sizes and half-life must be positive")
         }
         let file = URL(fileURLWithPath: storageState)
+        let ledger = StorageLedger(
+            budget: storageBudget,
+            largestGroup: storageLargestGroup,
+            halfLife: storageHalfLife * 1000,
+            state: try StorageLedger.load(from: file)
+        )
+        // A claim that cannot reach the disk is a pin forgotten at restart.
+        do {
+            try ledger.save(to: file)
+        } catch {
+            throw ValidationError("--storage-state \(file.path) cannot be written: \(error)")
+        }
         return StorageSeller(
-            ledger: StorageLedger(
-                budget: storageBudget,
-                largestGroup: storageLargestGroup,
-                halfLife: storageHalfLife * 1000,
-                state: try StorageLedger.load(from: file)
-            ),
+            ledger: ledger,
             node: StorageNode(base: base, authorization: { rpcCookieAuthorization(file: cookie) }),
             file: file,
             now: now
@@ -434,7 +441,9 @@ actor Sponsor {
         let store = storage == nil ? nil : store
         if let store {
             guard peer == nil else { throw SponsorRefusal.draft("work buys serving or storage, not both") }
-            guard CIDIdentity.isCanonical(store) else { throw SponsorRefusal.draft("store is not a canonical CID") }
+            guard store.utf8.count <= 256, CIDIdentity.isCanonical(store) else {
+                throw SponsorRefusal.draft("store is not a canonical CID")
+            }
             guard pay == 0 else { throw SponsorRefusal.draft("storage work pays nothing") }
             // One chain's coins, so credit per byte compares across groups.
             guard chainPath == [DEFAULT_ROOT_DIRECTORY] else {
