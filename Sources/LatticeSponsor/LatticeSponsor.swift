@@ -27,23 +27,23 @@
 // the key's authority to the body, so the key must own nothing a draft could
 // reach. Credit is held in memory; a restart forfeits unspent shares.
 //
-// With --sell-serving, work naming a reader's Ivy peer buys serving balance
-// on the node instead of fee credit: each share's value on its chain, times
-// the node's bytes per coin there, posted to the node for that peer at each
-// few seconds. Owed bytes are held in memory too; a post the node does not
-// take is retried at the next one. Without the flag, a peer is ignored.
-//
 // With --sell-storage, work naming an upload's root as `store` pays for it at
 // --storage-rate bytes per coin; once paid, every Volume is pinned on the
 // node for good. Unpaid uploads are held in memory for an hour, paid ones until
 // pinned, and a restart forfeits them; the roots pinned are kept in --storage-file.
 //
+// With --pay-to, a transfer to that account, --coin-depth blocks deep, buys
+// the same storage at the same rates, claimed once by one of its signers on
+// POST /pay; the transfers credited are kept beside --storage-file.
+//
 // Routes (JSON, 64-bit integers as decimal strings, targets and work as hex):
-//   POST /work     {client?, chain?, pay?, peer?} → a nonce range of the template
+//   POST /work     {client?, chain?, pay?, store?} → a nonce range of the template
 //   POST /shares   {assignment, nonce}            → the client's credit on its chain
 //   POST /sponsor  {client, transaction, pay?}    → the co-signed transaction
 //   POST /store    {root, volumes}                → the upload's status
 //   GET  /store/:root                             → {root, bytes, needed, credit, stored}
+//   POST /pay      {chain, txCID, signer, signature, store} → {bytes}
+//   GET  /terms                                   → {payTo, depth, storageRates}
 //
 // A `pay` is coins the sponsor also credits the client in the transaction,
 // bought with the same shares as the fee, up to --most-pay (by default, the
@@ -89,9 +89,6 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
     @Option(name: .long, help: "The most coins to pay a client within one transaction, for its shares (default: the chain's block reward; 0: fees only).")
     var mostPay: UInt64?
 
-    @Flag(name: .long, help: "Sell serving: work naming a reader's peer buys serving balance on the node instead of fee credit.")
-    var sellServing = false
-
     @Flag(name: .long, help: "Sell storage: work naming an upload's root pins its Volumes on the node for good.")
     var sellStorage = false
 
@@ -103,6 +100,12 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
 
     @Option(name: .long, help: "With --sell-storage: the JSON file of the roots pinned.")
     var storageFile: String = "lattice-sponsor-storage.json"
+
+    @Option(name: .long, help: "With --sell-storage: the account a transfer pays to buy storage in coin, at --storage-rate. Unset: no coin is taken.")
+    var payTo: String?
+
+    @Option(name: .long, help: "With --pay-to: blocks built on the block carrying a transfer before it is credited.")
+    var coinDepth: UInt64 = 6
 
     @Option(name: .long, help: "Listen address.")
     var host: String = "127.0.0.1"
@@ -134,6 +137,15 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
                 budget: storageBudget, rates: rates, file: URL(fileURLWithPath: storageFile)
             )
         }
+        var payments: PaymentLedger?
+        if let payTo {
+            guard sellStorage else { throw ValidationError("--pay-to requires --sell-storage") }
+            guard CryptoUtils.isValidAddress(payTo) else { throw ValidationError("--pay-to is not an address") }
+            payments = try PaymentLedger(
+                file: URL(fileURLWithPath: storageFile).deletingLastPathComponent()
+                    .appendingPathComponent("lattice-sponsor-payments.json")
+            )
+        }
         let sponsor = Sponsor(
             ledger: SponsorLedger(shareTarget: minimumWorkTarget(work)),
             rpc: rpc,
@@ -141,10 +153,11 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
             minimumFee: fee,
             mostPay: mostPay,
             tokenKey: SymmetricKey(size: .bits256),
-            servingNode: sellServing
-                ? ServingNode(base: base, authorization: { rpcCookieAuthorization(file: cookie) }) : nil,
             storage: storage,
-            pinNode: ServingNode(base: base, authorization: { rpcCookieAuthorization(file: cookie) })
+            pinNode: SponsorNode(base: base, authorization: { rpcCookieAuthorization(file: cookie) }),
+            payTo: payTo,
+            coinDepth: coinDepth,
+            payments: payments
         )
         let templates = HTTPMiningCoordinatorNodeClient(
             apiBaseURL: base, cookieFile: URL(fileURLWithPath: cookieFile)
@@ -168,15 +181,6 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
             }
         }
         defer { refresh.cancel() }
-        // Apart from the template refresh, so a slow node answering serving
-        // posts never lets the template expire under fee clients.
-        let servingPosts = Task {
-            while !Task.isCancelled {
-                await sponsor.postServing()
-                try? await Task.sleep(for: .seconds(5))
-            }
-        }
-        defer { servingPosts.cancel() }
 
         let router = Router()
         // Wallets call this from web pages. No cookie or credential rides on
@@ -186,8 +190,7 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
             let input = try await request.decode(as: WorkRequest.self, context: context)
             return try await refusing {
                 try await sponsor.work(
-                    client: input.client, chainPath: input.chainPath, pay: input.pay ?? 0, peer: input.peer,
-                    store: input.store
+                    client: input.client, chainPath: input.chainPath, pay: input.pay ?? 0, store: input.store
                 )
             }
         }
@@ -230,6 +233,13 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
                 return status
             }
         }
+        router.get("terms") { _, _ in await sponsor.terms() }
+        if payTo != nil {
+            router.post("pay") { request, context in
+                let input = try await request.decode(as: CoinPayment.self, context: context)
+                return try await refusing { try await sponsor.pay(input) }
+            }
+        }
         print("sponsor \(signer.address) listening on \(host):\(port)")
         let app = Application(
             responder: router.buildResponder(),
@@ -247,9 +257,6 @@ struct WorkRequest: Decodable {
     /// Coins the sponsor is to pay the client as well; `sharesForFee` then
     /// buys both.
     @OptionalDecimalString var pay: UInt64?
-    /// The reader's Ivy peer ID: its shares buy serving balance on the node
-    /// for that peer, not fee credit (with --sell-serving; ignored without).
-    let peer: String?
     /// An upload's root: its shares pay for storing it (with --sell-storage;
     /// ignored without).
     let store: String?
@@ -271,7 +278,7 @@ struct WorkResponse: ResponseEncodable {
     /// What the sponsor pays the client as well, as asked.
     @DecimalString var pay: UInt64
     /// Shares that buy `fee` and `pay` at the current price, saturating
-    /// (zero, with `fee` and `pay`, for serving work).
+    /// (zero, with `fee` and `pay`, for storage work).
     @DecimalString var sharesForFee: UInt64
     @DecimalString var expiresInMilliseconds: UInt64
 }
@@ -284,9 +291,6 @@ struct ShareRequest: Decodable {
 struct ShareResponse: ResponseEncodable {
     /// The client's credit on the assignment's chain, in whole units.
     @DecimalString var credit: UInt64
-    /// For serving work: the bytes the sponsor owes the peer and has not yet
-    /// posted to the node.
-    @OptionalDecimalString var bytes: UInt64?
 }
 
 struct StoreRequest: Decodable {
@@ -311,6 +315,18 @@ struct StoreResponse: ResponseEncodable {
         credit = UInt64(status.credit)
         stored = status.stored
     }
+}
+
+struct PayResponse: ResponseEncodable {
+    /// The bytes of storage the transfer bought.
+    @DecimalString var bytes: UInt64
+}
+
+struct TermsResponse: ResponseEncodable {
+    let payTo: String?
+    @DecimalString var depth: UInt64
+    /// Bytes per coin, by chain path.
+    let storageRates: [String: Int]
 }
 
 struct SponsorRequest: Decodable {
@@ -345,16 +361,18 @@ actor Sponsor {
     /// refresh so a request reads nothing from the node.
     private var fees: [[String]: UInt64] = [:]
     private var balances: [[String]: UInt64] = [:]
-    /// The node's serving routes, with --sell-serving.
-    private let servingNode: ServingNode?
-    private var serving = ServingLedger()
     /// Uploads and the roots pinned, with --sell-storage.
     private var storage: StorageLedger?
-    private let pinNode: ServingNode
+    private let pinNode: SponsorNode
+    /// The account coin is paid to, with --pay-to, and the transfers credited.
+    private let payTo: String?
+    private let coinDepth: UInt64
+    private var payments: PaymentLedger?
 
     init(
         ledger: SponsorLedger, rpc: SponsorRPC, key: SponsorKey, minimumFee: UInt64, mostPay: UInt64?,
-        tokenKey: SymmetricKey, servingNode: ServingNode?, storage: StorageLedger?, pinNode: ServingNode
+        tokenKey: SymmetricKey, storage: StorageLedger?,
+        pinNode: SponsorNode, payTo: String?, coinDepth: UInt64, payments: PaymentLedger?
     ) {
         self.ledger = ledger
         self.rpc = rpc
@@ -362,9 +380,11 @@ actor Sponsor {
         self.minimumFee = minimumFee
         self.mostPay = mostPay
         self.tokenKey = tokenKey
-        self.servingNode = servingNode
         self.storage = storage
         self.pinNode = pinNode
+        self.payTo = payTo
+        self.coinDepth = coinDepth
+        self.payments = payments
     }
 
     /// Take `template` as the newest work, priced on every chain whose block
@@ -401,20 +421,14 @@ actor Sponsor {
         ), now: now())
     }
 
-    func work(client: String?, chainPath: [String], pay: UInt64, peer: String?, store: String?) throws -> WorkResponse {
+    func work(client: String?, chainPath: [String], pay: UInt64, store: String?) throws -> WorkResponse {
         var fee: UInt64 = 0
         var shares = UInt256.zero
-        // Without --sell-serving, a peer is ignored: the work is fee work.
-        let peer = servingNode == nil ? nil : peer
-        // Without --sell-storage, so is a store.
+        // Without --sell-storage, a store is ignored: the work is fee work.
         let store = storage == nil ? nil : store
         if let store {
-            guard peer == nil, pay == 0 else { throw SponsorRefusal.draft("storage work pays nothing else") }
+            guard pay == 0 else { throw SponsorRefusal.draft("storage work pays nothing else") }
             try storage!.check(root: store, on: chainPath, now: now())
-        } else if let peer {
-            guard !peer.isEmpty, peer.utf8.count <= 256 else { throw SponsorRefusal.draft("peer out of range") }
-            guard pay == 0 else { throw SponsorRefusal.draft("serving work pays nothing") }
-            _ = try serving.rate(on: chainPath)
         } else {
             fee = try currentFee(chainPath)
         }
@@ -423,8 +437,8 @@ actor Sponsor {
             guard isIssued(token) else { throw SponsorRefusal.draft("unknown client token") }
             return token
         } ?? issueToken()
-        let assignment = try ledger.assign(client: client, on: chainPath, peer: peer, store: store, now: now())
-        if peer == nil, store == nil {
+        let assignment = try ledger.assign(client: client, on: chainPath, store: store, now: now())
+        if store == nil {
             shares = ledger.sharesFor(fee: total, on: chainPath) ?? .max
         }
         return WorkResponse(
@@ -451,24 +465,17 @@ actor Sponsor {
             midstate: ProofOfWork.midstate(prefixBytes: ContiguousArray(prefix)), nonce: nonce
         )
         let credited = Result { () throws -> ShareResponse in
-            // A chain without a rate is refused before the share is spent.
-            if held.peer != nil { _ = try serving.rate(on: held.chainPath) }
-            // So is an upload no longer held.
+            // An upload no longer held is refused before the share is spent.
             if let store = held.store {
                 guard let storage else { throw SponsorRefusal.unknownUpload }
                 try storage.check(root: store, on: held.chainPath, now: now())
             }
             let value = try ledger.credit(assignment: assignment, nonce: nonce, hash: hash, now: now())
-            var bytes: UInt64?
             if let store = held.store {
                 try storage!.credit(root: store, value: value, on: held.chainPath, now: now())
             }
-            if let peer = held.peer {
-                try serving.credit(peer: peer, value: value, on: held.chainPath, now: now())
-                bytes = UInt64(serving.owed(to: peer))
-            }
             let units = ledger.credit(of: held.client, on: held.chainPath) / SponsorLedger.unit
-            return ShareResponse(credit: units > UInt256(UInt64.max) ? .max : UInt64(units.words[0]), bytes: bytes)
+            return ShareResponse(credit: units > UInt256(UInt64.max) ? .max : UInt64(units.words[0]))
         }
         return (credited, ledger.block(assignment: assignment, nonce: nonce, hash: hash, now: now()), held.store)
     }
@@ -527,18 +534,44 @@ actor Sponsor {
         )
     }
 
-    /// Read the node's serving rates, and post each peer's owed bytes; what
-    /// the node does not take stays owed for the next refresh.
-    func postServing() async {
-        guard let servingNode else { return }
+    /// Credit a transfer to `payTo` once, as storage for an upload held with
+    /// --sell-storage.
+    func pay(_ payment: CoinPayment) async throws -> PayResponse {
+        guard let payTo, payments != nil else { throw SponsorRefusal.noPayment }
+        let chainPath = payment.chainPath
+        // Refused before reading the node, and again after, since an upload
+        // can expire meanwhile. Returns the chain's rate.
+        func check(at now: Int64) throws -> Int {
+            guard let storage else { throw SponsorRefusal.unknownUpload }
+            try storage.check(root: payment.store, on: chainPath, now: now)
+            return try storage.rate(on: chainPath)
+        }
+        _ = try check(at: now())
+        try payments!.claim(payment.txCID)
         do {
-            serving.install(rates: try await servingNode.rates())
+            let coins = try await pinNode.verify(payment, payTo: payTo, depth: coinDepth)
+            // One instant, so the credit below cannot fail once checked.
+            let at = now()
+            let rate = try check(at: at)
+            try payments!.release(payment.txCID, credit: true)
+            let value = UInt256(coins) * SponsorLedger.unit
+            try storage!.credit(root: payment.store, value: value, on: chainPath, now: at)
+            Task { await pinIfPaid(payment.store) }
+            let (bytes, overflow) = coins.multipliedReportingOverflow(by: UInt64(rate))
+            return PayResponse(bytes: overflow ? .max : bytes)
         } catch {
-            print("serving terms fetch failed: \(error)")
+            try? payments!.release(payment.txCID, credit: false)
+            throw error
         }
-        for (peer, bytes) in await servingNode.post(serving.take(now: now())) {
-            serving.restore(peer: peer, bytes: bytes, now: now())
+    }
+
+    func terms() -> TermsResponse {
+        func named(_ rates: [[String]: Int]) -> [String: Int] {
+            Dictionary(uniqueKeysWithValues: rates.map { ($0.key.joined(separator: "/"), $0.value) })
         }
+        return TermsResponse(
+            payTo: payTo, depth: coinDepth, storageRates: named(storage?.rates ?? [:])
+        )
     }
 
     /// What the sponsor spends for a fee and a payment, within --most-pay.
@@ -601,6 +634,9 @@ func refusing<Value: Sendable>(_ body: () async throws -> Value) async throws ->
         let status: HTTPResponse.Status = switch refusal {
         case .busy, .unpriceable, .insufficientFloat, .soldOut: .serviceUnavailable
         case .insufficientCredit: .init(code: 402, reasonPhrase: "Payment Required")
+        case .notIncluded: .notFound
+        case .notDeepEnough: .init(code: 425, reasonPhrase: "Too Early")
+        case .alreadyCredited: .conflict
         default: .badRequest
         }
         throw HTTPError(status, message: "\(refusal)")

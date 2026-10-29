@@ -35,6 +35,7 @@ let package = Package(
             name: "LatticeSponsorCore",
             dependencies: [
                 .product(name: "LatticeMinerCore", package: "lattice-node"),
+                .product(name: "LatticeNodeAPI", package: "lattice-node"),
                 .product(name: "Lattice", package: "lattice"),
                 .product(name: "UInt256", package: "UInt256"),
             ]),
@@ -57,6 +58,7 @@ let package = Package(
             dependencies: [
                 "LatticeSponsorCore",
                 .product(name: "LatticeMinerCore", package: "lattice-node"),
+                .product(name: "LatticeNodeAPI", package: "lattice-node"),
                 .product(name: "Lattice", package: "lattice"),
                 .product(name: "cashew", package: "cashew"),
                 .product(name: "UInt256", package: "UInt256"),
