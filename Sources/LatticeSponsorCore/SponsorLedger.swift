@@ -85,6 +85,8 @@ public struct ShareAssignment: Sendable, Equatable {
     public let expiresAt: Int64
     /// The upload's root, when its shares pay for storage instead.
     public let store: String?
+    /// The peer whose standing its shares raise, when they pay for serving.
+    public let peer: String?
 }
 
 public enum SponsorRefusal: Error, Sendable, Equatable {
@@ -115,6 +117,11 @@ public enum SponsorRefusal: Error, Sendable, Equatable {
     case draft(String)
     /// The sponsor sets no storage rate on the chain.
     case noStorageRate
+    /// The sponsor sets no serving rate on the chain.
+    case noServingRate
+    /// The node did not take the serving credit; the share or payment is
+    /// spent and its credit lost.
+    case servingNotCredited
     /// The upload does not fit in what is left of the storage budget.
     case overBudget
     /// No upload is held under that root: it expired, or was never made.
@@ -198,9 +205,9 @@ public struct SponsorLedger: Sendable {
 
     /// A fresh nonce range of the newest template for `client`, its shares
     /// credited on `chainPath` at this template's price: as fee credit, or
-    /// with a `store`, to that upload.
+    /// with a `store`, to that upload, or with a `peer`, to its standing.
     public mutating func assign(
-        client: String, on chainPath: [String], store: String? = nil, now: Int64
+        client: String, on chainPath: [String], store: String? = nil, peer: String? = nil, now: Int64
     ) throws -> ShareAssignment {
         guard let template = latest, now < template.expiresAt,
               let price = template.prices[chainPath],
@@ -233,7 +240,8 @@ public struct SponsorLedger: Sendable {
             startNonce: start,
             count: rangeSize,
             expiresAt: template.expiresAt,
-            store: store
+            store: store,
+            peer: peer
         )
         assignments[assignment.id] = assignment
         return assignment
@@ -242,8 +250,8 @@ public struct SponsorLedger: Sendable {
     /// Credit one share: `nonce` inside the assignment's range whose hash
     /// clears the share target. `hash` is the template's PoW hash at `nonce`
     /// (`ProofOfWork.hash`), computed by the caller from the prefix. Returns
-    /// the share's value; an assignment with a store is not fee credit, so
-    /// the caller owes that value to the upload instead.
+    /// the share's value; an assignment with a store or a peer is not fee
+    /// credit, so the caller owes that value to the upload or peer instead.
     ///
     /// Only one block per height can be the chain's, so the credit a height
     /// backs, across every template and client, stops at its block's
@@ -273,7 +281,7 @@ public struct SponsorLedger: Sendable {
         guard backed < assignment.blockValue else { throw SponsorRefusal.soldOut }
         let value = min(assignment.shareValue, assignment.blockValue - backed)
         sold[block] = backed + value
-        guard assignment.store == nil else { return value }
+        guard assignment.store == nil, assignment.peer == nil else { return value }
         let key = CreditKey(client: assignment.client, chainPath: assignment.chainPath)
         let (sum, overflow) = (credits[key]?.value ?? .zero).addingReportingOverflow(value)
         credits[key] = (overflow ? UInt256.max : sum, now)

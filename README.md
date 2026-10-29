@@ -42,8 +42,10 @@ lattice-sponsor \
 - `--sell-storage` lets work buy a permanent pin for a file (see
   [Storage](#storage)), with `--storage-budget`, `--storage-rate` and
   `--storage-file`.
-- `--pay-to` lets coin buy storage too (see [Paying in coin](#paying-in-coin)),
-  with `--coin-depth`.
+- `--serving-rate` lets work buy a peer serving standing on the node (see
+  [Serving](#serving)).
+- `--pay-to` lets coin buy storage or serving too (see
+  [Paying in coin](#paying-in-coin)), with `--coin-depth`.
 
 Credit is held in memory, so a restart forfeits unspent shares. A chain's
 reward schedule is read once, so a chain re-hosted under the same path with a
@@ -60,13 +62,13 @@ JSON; 64-bit integers are decimal strings, and targets and work are hex.
 
 | Route | Body | Returns |
 |---|---|---|
-| `POST /work` | `{client?, chain?, pay?, store?}` | a nonce range of the template, and the shares that buy the fee and `pay` |
-| `POST /shares` | `{assignment, nonce}` | the client's credit on its chain |
+| `POST /work` | `{client?, chain?, pay?, store? \| peer?}` | a nonce range of the template, and the shares that buy the fee and `pay` |
+| `POST /shares` | `{assignment, nonce}` | the client's credit on its chain, and `serving` bytes for serving work |
 | `POST /sponsor` | `{client, transaction, pay?}` | the co-signed transaction |
 | `POST /store` | `{root, volumes: [{cid, entries?, bytes?}]}` | `{root, bytes, needed, credit, stored}` |
 | `GET /store/:root` | | `{root, bytes, needed, credit, stored}` |
-| `POST /pay` | `{chain, txCID, signer, signature, store}` | `{bytes}` bought |
-| `GET /terms` | | `{payTo, depth, storageRates}` |
+| `POST /pay` | `{chain, txCID, signer, signature, store \| peer}` | `{bytes}` bought |
+| `GET /terms` | | `{payTo, depth, storageRates, servingRates}` |
 
 With a `pay`, the sponsor credits the client `pay` within the transaction, and
 debits itself the fee plus `pay`. The client's own debits net against that
@@ -98,10 +100,26 @@ ever unpinned. An upload not yet paid is held in memory for an hour, and a
 paid one until it is pinned; a restart forfeits either, with its credit, as it
 does fee credit.
 
+## Serving
+
+The node serves anyone free while it has free serving slots. When it is busy,
+peers share its slots by standing: a byte balance per peer, used up by the
+bytes it is served. Credit only raises a peer's share when the node is busy.
+
+With `--serving-rate <chain>=<bytesPerCoin>` (repeatable), a client asks
+`POST /work` with `peer: <the peer's 64 lowercase hex Ed25519 key>` instead of
+`store`, on a chain with a serving rate (otherwise `noServingRate`). Each
+accepted share's value times the rate, rounded down, is posted to the node's
+`POST /serving-credit` at once, and `/shares` answers it as `serving`; a share
+worth less than a byte credits nothing. If the node does not take it,
+`/shares` is refused `servingNotCredited` (502): the share is spent and its
+serving credit lost. Serving credit pays no fee, `pay` or storage, and fee or
+storage credit buys no serving.
+
 ## Paying in coin
 
-With `--pay-to <address>` (and `--sell-storage`), an uploader can pay in coin
-instead of work, at the same `--storage-rate`. It sends coins to that address
+With `--pay-to <address>` (and `--sell-storage` or `--serving-rate`), an
+uploader can pay in coin instead of work, at the same `--storage-rate`. It sends coins to that address
 on a chain with a rate, then, once the transaction is `--coin-depth` (default
 6) blocks below the tip of the node's canonical chain, claims it with
 `POST /pay`, naming the upload's root as `store`. `signer` is one of the
@@ -109,7 +127,12 @@ transaction's signers, and `signature` its `CryptoUtils.sign` signature over
 `lattice-sponsor-pay:v1:<chain>:<txCID>:<store>`.
 
 What the transaction pays `--pay-to` on that chain, net, times the rate, is
-added to the upload's credit, which pins it once paid. Each transaction is credited once; the ones credited are kept in
+added to the upload's credit, which pins it once paid. Named `peer` instead of
+`store`, the signature is over
+`lattice-sponsor-pay-serving:v1:<chain>:<txCID>:<peer>`, and the transfer
+times `--serving-rate` is posted to the node's `POST /serving-credit` in one
+call; if that fails (`servingNotCredited`, 502), the transaction is still
+credited and the payment used up, as with any node failure after the claim. Each transaction is credited once; the ones credited are kept in
 `lattice-sponsor-payments.json` beside `--storage-file`. Refusals are named:
 `notIncluded` (404), `notDeepEnough` (425, retry later), `notSigner`,
 `invalidSignature`, `noPayment`, `alreadyCredited` (409). The sponsor reads

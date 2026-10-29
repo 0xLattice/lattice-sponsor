@@ -36,14 +36,18 @@
 // the same storage at the same rates, claimed once by one of its signers on
 // POST /pay; the transfers credited are kept beside --storage-file.
 //
+// With --serving-rate, work or a transfer naming a `peer` raises that peer's
+// standing on the node: each accepted share, and each payment, is posted to
+// the node's POST /serving-credit at once, and a failed post loses it.
+//
 // Routes (JSON, 64-bit integers as decimal strings, targets and work as hex):
-//   POST /work     {client?, chain?, pay?, store?} → a nonce range of the template
+//   POST /work     {client?, chain?, pay?, store?|peer?} → a nonce range of the template
 //   POST /shares   {assignment, nonce}            → the client's credit on its chain
 //   POST /sponsor  {client, transaction, pay?}    → the co-signed transaction
 //   POST /store    {root, volumes}                → the upload's status
 //   GET  /store/:root                             → {root, bytes, needed, credit, stored}
-//   POST /pay      {chain, txCID, signer, signature, store} → {bytes}
-//   GET  /terms                                   → {payTo, depth, storageRates}
+//   POST /pay      {chain, txCID, signer, signature, store|peer} → {bytes}
+//   GET  /terms                                   → {payTo, depth, storageRates, servingRates}
 //
 // A `pay` is coins the sponsor also credits the client in the transaction,
 // bought with the same shares as the fee, up to --most-pay (by default, the
@@ -101,7 +105,10 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
     @Option(name: .long, help: "With --sell-storage: the JSON file of the roots pinned.")
     var storageFile: String = "lattice-sponsor-storage.json"
 
-    @Option(name: .long, help: "With --sell-storage: the account a transfer pays to buy storage in coin, at --storage-rate. Unset: no coin is taken.")
+    @Option(name: .long, help: "A chain whose work or coin raises a peer's serving standing on the node, and the bytes one unit of it buys, as chain-path=bytesPerCoin (repeatable). Unset: no serving credit.")
+    var servingRate: [String] = []
+
+    @Option(name: .long, help: "With --sell-storage or --serving-rate: the account a transfer pays to buy storage or serving in coin, at their rates. Unset: no coin is taken.")
     var payTo: String?
 
     @Option(name: .long, help: "With --pay-to: blocks built on the block carrying a transfer before it is credited.")
@@ -121,25 +128,33 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
         let signer = try SponsorKey(file: key)
         let rpc = SponsorRPC(base: base, cookieFile: URL(fileURLWithPath: cookieFile))
         let cookie = URL(fileURLWithPath: cookieFile)
-        var storage: StorageLedger?
-        if sellStorage {
+        func parseRates(_ values: [String], flag: String) throws -> [[String]: Int] {
             var rates: [[String]: Int] = [:]
-            for value in storageRate {
+            for value in values {
                 let parts = value.split(separator: "=", maxSplits: 1).map(String.init)
                 guard parts.count == 2, let bytesPerCoin = Int(parts[1]), bytesPerCoin > 0 else {
-                    throw ValidationError("--storage-rate takes chain-path=bytesPerCoin, bytesPerCoin at least 1")
+                    throw ValidationError("\(flag) takes chain-path=bytesPerCoin, bytesPerCoin at least 1")
                 }
                 let chainPath = parts[0].components(separatedBy: "/")
-                guard rates[chainPath] == nil else { throw ValidationError("--storage-rate names \(parts[0]) twice") }
+                guard rates[chainPath] == nil else { throw ValidationError("\(flag) names \(parts[0]) twice") }
                 rates[chainPath] = bytesPerCoin
             }
+            return rates
+        }
+        var storage: StorageLedger?
+        if sellStorage {
             storage = try StorageLedger(
-                budget: storageBudget, rates: rates, file: URL(fileURLWithPath: storageFile)
+                budget: storageBudget, rates: try parseRates(storageRate, flag: "--storage-rate"),
+                file: URL(fileURLWithPath: storageFile)
             )
         }
+        let serving = ServingCredit(rates: try parseRates(servingRate, flag: "--serving-rate"))
+        let node = SponsorNode(base: base, authorization: { rpcCookieAuthorization(file: cookie) })
         var payments: PaymentLedger?
         if let payTo {
-            guard sellStorage else { throw ValidationError("--pay-to requires --sell-storage") }
+            guard sellStorage || !serving.rates.isEmpty else {
+                throw ValidationError("--pay-to requires --sell-storage or --serving-rate")
+            }
             guard CryptoUtils.isValidAddress(payTo) else { throw ValidationError("--pay-to is not an address") }
             payments = try PaymentLedger(
                 file: URL(fileURLWithPath: storageFile).deletingLastPathComponent()
@@ -154,7 +169,8 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
             mostPay: mostPay,
             tokenKey: SymmetricKey(size: .bits256),
             storage: storage,
-            pinNode: SponsorNode(base: base, authorization: { rpcCookieAuthorization(file: cookie) }),
+            serving: serving,
+            pinNode: node,
             payTo: payTo,
             coinDepth: coinDepth,
             payments: payments
@@ -190,13 +206,14 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
             let input = try await request.decode(as: WorkRequest.self, context: context)
             return try await refusing {
                 try await sponsor.work(
-                    client: input.client, chainPath: input.chainPath, pay: input.pay ?? 0, store: input.store
+                    client: input.client, chainPath: input.chainPath, pay: input.pay ?? 0,
+                    store: input.store, peer: input.peer
                 )
             }
         }
         router.post("shares") { request, context in
             let input = try await request.decode(as: ShareRequest.self, context: context)
-            let (response, block, store) = await sponsor.share(assignment: input.assignment, nonce: input.nonce)
+            let (response, block, held) = await sponsor.share(assignment: input.assignment, nonce: input.nonce)
             if let block {
                 do {
                     let submitted = try await templates.submit(workId: block, nonce: input.nonce)
@@ -207,8 +224,12 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
             }
             // Pinning reads and writes every Volume: neither the block nor
             // the share's answer waits for it.
-            if let store { Task { await sponsor.pinIfPaid(store) } }
-            return try await refusing { try response.get() }
+            if let store = held?.store { Task { await sponsor.pinIfPaid(store) } }
+            return try await refusing {
+                let answer = try response.get()
+                if let peer = held?.peer { try await node.creditServing(peer: peer, bytes: Int(answer.serving ?? 0)) }
+                return answer
+            }
         }
         router.post("sponsor") { request, context in
             let input = try await request.decode(as: SponsorRequest.self, context: context)
@@ -260,6 +281,9 @@ struct WorkRequest: Decodable {
     /// An upload's root: its shares pay for storing it (with --sell-storage;
     /// ignored without).
     let store: String?
+    /// A peer's key, instead of `store`: its shares raise its serving
+    /// standing on the node.
+    let peer: String?
 
     var chainPath: [String] {
         (chain ?? DEFAULT_ROOT_DIRECTORY).components(separatedBy: "/")
@@ -278,7 +302,7 @@ struct WorkResponse: ResponseEncodable {
     /// What the sponsor pays the client as well, as asked.
     @DecimalString var pay: UInt64
     /// Shares that buy `fee` and `pay` at the current price, saturating
-    /// (zero, with `fee` and `pay`, for storage work).
+    /// (zero, with `fee` and `pay`, for storage or serving work).
     @DecimalString var sharesForFee: UInt64
     @DecimalString var expiresInMilliseconds: UInt64
 }
@@ -291,6 +315,8 @@ struct ShareRequest: Decodable {
 struct ShareResponse: ResponseEncodable {
     /// The client's credit on the assignment's chain, in whole units.
     @DecimalString var credit: UInt64
+    /// For serving work, the bytes of standing the share bought.
+    @OptionalDecimalString var serving: UInt64?
 }
 
 struct StoreRequest: Decodable {
@@ -318,16 +344,11 @@ struct StoreResponse: ResponseEncodable {
 }
 
 struct PayResponse: ResponseEncodable {
-    /// The bytes of storage the transfer bought.
+    /// The bytes of storage or serving standing the transfer bought.
     @DecimalString var bytes: UInt64
 }
 
-struct TermsResponse: ResponseEncodable {
-    let payTo: String?
-    @DecimalString var depth: UInt64
-    /// Bytes per coin, by chain path.
-    let storageRates: [String: Int]
-}
+extension SponsorTerms: ResponseEncodable {}
 
 struct SponsorRequest: Decodable {
     let client: String
@@ -363,6 +384,7 @@ actor Sponsor {
     private var balances: [[String]: UInt64] = [:]
     /// Uploads and the roots pinned, with --sell-storage.
     private var storage: StorageLedger?
+    private let serving: ServingCredit
     private let pinNode: SponsorNode
     /// The account coin is paid to, with --pay-to, and the transfers credited.
     private let payTo: String?
@@ -371,7 +393,7 @@ actor Sponsor {
 
     init(
         ledger: SponsorLedger, rpc: SponsorRPC, key: SponsorKey, minimumFee: UInt64, mostPay: UInt64?,
-        tokenKey: SymmetricKey, storage: StorageLedger?,
+        tokenKey: SymmetricKey, storage: StorageLedger?, serving: ServingCredit,
         pinNode: SponsorNode, payTo: String?, coinDepth: UInt64, payments: PaymentLedger?
     ) {
         self.ledger = ledger
@@ -381,6 +403,7 @@ actor Sponsor {
         self.mostPay = mostPay
         self.tokenKey = tokenKey
         self.storage = storage
+        self.serving = serving
         self.pinNode = pinNode
         self.payTo = payTo
         self.coinDepth = coinDepth
@@ -421,12 +444,16 @@ actor Sponsor {
         ), now: now())
     }
 
-    func work(client: String?, chainPath: [String], pay: UInt64, store: String?) throws -> WorkResponse {
+    func work(client: String?, chainPath: [String], pay: UInt64, store: String?, peer: String?) throws -> WorkResponse {
         var fee: UInt64 = 0
         var shares = UInt256.zero
+        try ServingCredit.check(peer: peer, store: store)
         // Without --sell-storage, a store is ignored: the work is fee work.
         let store = storage == nil ? nil : store
-        if let store {
+        if peer != nil {
+            guard pay == 0 else { throw SponsorRefusal.draft("serving work pays nothing else") }
+            _ = try serving.rate(on: chainPath)
+        } else if let store {
             guard pay == 0 else { throw SponsorRefusal.draft("storage work pays nothing else") }
             try storage!.check(root: store, on: chainPath, now: now())
         } else {
@@ -437,8 +464,8 @@ actor Sponsor {
             guard isIssued(token) else { throw SponsorRefusal.draft("unknown client token") }
             return token
         } ?? issueToken()
-        let assignment = try ledger.assign(client: client, on: chainPath, store: store, now: now())
-        if store == nil {
+        let assignment = try ledger.assign(client: client, on: chainPath, store: store, peer: peer, now: now())
+        if store == nil, peer == nil {
             shares = ledger.sharesFor(fee: total, on: chainPath) ?? .max
         }
         return WorkResponse(
@@ -456,8 +483,8 @@ actor Sponsor {
     }
 
     /// Credit a share, and name the template it is a block of, if any,
-    /// whether or not it was credited, and the upload it paid, if any.
-    func share(assignment: String, nonce: UInt64) -> (Result<ShareResponse, any Error>, String?, String?) {
+    /// whether or not it was credited, and its assignment.
+    func share(assignment: String, nonce: UInt64) -> (Result<ShareResponse, any Error>, String?, ShareAssignment?) {
         guard let held = ledger.assignment(assignment), let prefix = Data(hex: held.prefixHex) else {
             return (.failure(SponsorRefusal.unknownAssignment), nil, nil)
         }
@@ -475,9 +502,12 @@ actor Sponsor {
                 try storage!.credit(root: store, value: value, on: held.chainPath, now: now())
             }
             let units = ledger.credit(of: held.client, on: held.chainPath) / SponsorLedger.unit
-            return ShareResponse(credit: units > UInt256(UInt64.max) ? .max : UInt64(units.words[0]))
+            return ShareResponse(
+                credit: units > UInt256(UInt64.max) ? .max : UInt64(units.words[0]),
+                serving: try held.peer.map { _ in UInt64(try serving.bytes(for: value, on: held.chainPath)) }
+            )
         }
-        return (credited, ledger.block(assignment: assignment, nonce: nonce, hash: hash, now: now()), held.store)
+        return (credited, ledger.block(assignment: assignment, nonce: nonce, hash: hash, now: now()), held)
     }
 
     func upload(root: String, volumes: [StoreVolume]) throws -> StoreResponse {
@@ -535,15 +565,16 @@ actor Sponsor {
     }
 
     /// Credit a transfer to `payTo` once, as storage for an upload held with
-    /// --sell-storage.
+    /// --sell-storage, or as a peer's serving standing.
     func pay(_ payment: CoinPayment) async throws -> PayResponse {
         guard let payTo, payments != nil else { throw SponsorRefusal.noPayment }
         let chainPath = payment.chainPath
         // Refused before reading the node, and again after, since an upload
         // can expire meanwhile. Returns the chain's rate.
         func check(at now: Int64) throws -> Int {
-            guard let storage else { throw SponsorRefusal.unknownUpload }
-            try storage.check(root: payment.store, on: chainPath, now: now)
+            if payment.peer != nil { return try serving.rate(on: chainPath) }
+            guard let storage, let store = payment.store else { throw SponsorRefusal.unknownUpload }
+            try storage.check(root: store, on: chainPath, now: now)
             return try storage.rate(on: chainPath)
         }
         _ = try check(at: now())
@@ -555,8 +586,15 @@ actor Sponsor {
             let rate = try check(at: at)
             try payments!.release(payment.txCID, credit: true)
             let value = UInt256(coins) * SponsorLedger.unit
-            try storage!.credit(root: payment.store, value: value, on: chainPath, now: at)
-            Task { await pinIfPaid(payment.store) }
+            if let peer = payment.peer {
+                // Credited above: a failed post loses the payment.
+                let bytes = try serving.bytes(for: value, on: chainPath)
+                try await pinNode.creditServing(peer: peer, bytes: bytes)
+                return PayResponse(bytes: UInt64(bytes))
+            }
+            let store = payment.store!
+            try storage!.credit(root: store, value: value, on: chainPath, now: at)
+            Task { await pinIfPaid(store) }
             let (bytes, overflow) = coins.multipliedReportingOverflow(by: UInt64(rate))
             return PayResponse(bytes: overflow ? .max : bytes)
         } catch {
@@ -565,12 +603,9 @@ actor Sponsor {
         }
     }
 
-    func terms() -> TermsResponse {
-        func named(_ rates: [[String]: Int]) -> [String: Int] {
-            Dictionary(uniqueKeysWithValues: rates.map { ($0.key.joined(separator: "/"), $0.value) })
-        }
-        return TermsResponse(
-            payTo: payTo, depth: coinDepth, storageRates: named(storage?.rates ?? [:])
+    func terms() -> SponsorTerms {
+        SponsorTerms(
+            payTo: payTo, depth: coinDepth, storageRates: storage?.rates ?? [:], servingRates: serving.rates
         )
     }
 
@@ -637,6 +672,7 @@ func refusing<Value: Sendable>(_ body: () async throws -> Value) async throws ->
         case .notIncluded: .notFound
         case .notDeepEnough: .init(code: 425, reasonPhrase: "Too Early")
         case .alreadyCredited: .conflict
+        case .servingNotCredited: .badGateway
         default: .badRequest
         }
         throw HTTPError(status, message: "\(refusal)")
