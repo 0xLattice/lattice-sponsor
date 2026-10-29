@@ -165,4 +165,14 @@ final class StorageCreditTests: XCTestCase {
             XCTAssertEqual($0 as? SponsorRefusal, .overBudget, "25 of 40 is stored")
         }
     }
+
+    /// lattice-storage's chunk Volume is one DAG-CBOR block `{bytes}` of
+    /// 1 MiB: 12 bytes of framing past 1 MiB, which an upload must take.
+    func testAFullFileChunkFits() throws {
+        var storage = try StorageLedger(budget: 4 << 20, rates: [market: 16], file: file)
+        let chunk = [StoreVolume(cid: "chunk", entries: ["chunk": bytes((1 << 20) + 12)])]
+        XCTAssertEqual(try storage.upload(root: "chunk", volumes: chunk, now: 0).bytes, (1 << 20) + 12)
+        let over = [StoreVolume(cid: "over", entries: ["over": bytes(StorageLedger.largestVolume + 1)])]
+        XCTAssertThrowsError(try storage.upload(root: "over", volumes: over, now: 0))
+    }
 }

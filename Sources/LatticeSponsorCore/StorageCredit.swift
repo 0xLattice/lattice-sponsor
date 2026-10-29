@@ -50,8 +50,10 @@ public struct StorageLedger: Sendable {
     public let lifetime: Int64
     let file: URL
     /// The most bytes in one Volume, raw, and as the body of its pin: the
-    /// node takes a `POST /pins` body of at most 2 MiB.
-    public static let largestVolume = 1 << 20
+    /// node takes a `POST /pins` body of at most 2 MiB. A raw Volume holds a
+    /// 1 MiB chunk of file bytes and its block's DAG-CBOR framing, as
+    /// lattice-storage lays a file out.
+    public static let largestVolume = (1 << 20) + 1024
     static let largestPin = 2 << 20
 
     public struct Upload: Sendable {
@@ -121,7 +123,7 @@ public struct StorageLedger: Sendable {
             }
             guard size <= Self.largestVolume,
                   try JSONEncoder().encode(volume).count < Self.largestPin - 1024 else {
-                throw SponsorRefusal.draft("a Volume is over 1 MiB")
+                throw SponsorRefusal.draft("a Volume is over 1 MiB and 1 KiB")
             }
             let (sum, overflow) = bytes.addingReportingOverflow(size)
             guard !overflow else { throw SponsorRefusal.overBudget }
