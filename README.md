@@ -41,6 +41,9 @@ lattice-sponsor \
 
 - `--sell-serving` lets work buy serving balance on the node instead of fee
   credit (see [Serving credit](#serving-credit)).
+- `--sell-storage` lets work buy a permanent pin for a file (see
+  [Storage](#storage)), with `--storage-budget`, `--storage-rate` and
+  `--storage-file`.
 
 Credit is held in memory, so a restart forfeits unspent shares, and serving
 bytes not yet posted to the node. A chain's
@@ -61,6 +64,8 @@ JSON; 64-bit integers are decimal strings, and targets and work are hex.
 | `POST /work` | `{client?, chain?, pay?, peer?}` | a nonce range of the template, and the shares that buy the fee and `pay` |
 | `POST /shares` | `{assignment, nonce}` | the client's credit on its chain, and for serving work the peer's `bytes` not yet posted |
 | `POST /sponsor` | `{client, transaction, pay?}` | the co-signed transaction |
+| `POST /store` | `{root, volumes: [{cid, entries?, bytes?}]}` | `{root, bytes, needed, credit, stored}` |
+| `GET /store/:root` | | `{root, bytes, needed, credit, stored}` |
 
 With a `pay`, the sponsor credits the client `pay` within the transaction, and
 debits itself the fee plus `pay`. The client's own debits net against that
@@ -90,6 +95,29 @@ peer's last share.
 Serving work is not fee credit and pays no `pay`. The caps above apply to it
 as to fee work, and so does block withholding: a reader can withhold the
 shares that are blocks, and its credit then buys serving instead of fees.
+
+## Storage
+
+A storage sponsor keeps files forever, for proof of work that mines real
+blocks. Anyone can run one, and an uploader can use several. The uploader
+trusts the host for availability only: bytes are checked by CID.
+
+With `--sell-storage`, an uploader sends `POST /store` with the file's root
+and every Volume in it, root included. A Volume carries its `entries` (CID to
+base64 bytes, as the node's `POST /pins` takes), or only its declared `bytes`,
+to be read later with the node's `GET /fetch` (and refused if larger). An
+upload that does not fit in what is left of `--storage-budget` is refused
+(`overBudget`). The answer's `needed` is the coins of work still owed on each
+chain `--storage-rate <chain>=<bytesPerCoin>` prices; `credit` is the bytes
+paid.
+
+The uploader then asks `POST /work` with `store: <root>` on a chain with a
+storage rate (otherwise `noStorageRate`), and posts shares as usual. Storage
+credit pays no fee, serving or `pay`. Once it covers the upload's bytes, the
+sponsor pins every Volume with the node's `POST /pins`, which checks each
+against its CID, and adds `{root, bytes}` to `--storage-file`. Nothing is
+ever unpinned. An upload not yet pinned is held in memory for an hour, and a
+restart forfeits it, with its credit, as it does fee credit.
 
 ## What it risks
 

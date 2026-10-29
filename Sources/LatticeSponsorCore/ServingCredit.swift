@@ -156,7 +156,7 @@ public struct ServingNode: Sendable {
         return unposted
     }
 
-    private func request(_ path: String) -> URLRequest {
+    func request(_ path: String) -> URLRequest {
         var request = URLRequest(url: base.appendingPathComponent(path))
         request.timeoutInterval = 10
         request.cachePolicy = .reloadIgnoringLocalCacheData
@@ -166,7 +166,7 @@ public struct ServingNode: Sendable {
         return request
     }
 
-    private func call(_ request: URLRequest) async throws -> Data {
+    func call(_ request: URLRequest) async throws -> Data {
         let (data, response) = try await send(request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard (200..<300).contains(status) else { throw Failure.status(status) }
