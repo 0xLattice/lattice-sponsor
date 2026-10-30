@@ -85,7 +85,8 @@ With `--sell-storage`, an uploader sends `POST /store` with the file's root
 and every Volume in it, root included. A Volume carries its `entries` (CID to
 base64 bytes, as the node's `POST /pins` takes), or only its declared `bytes`,
 to be read later with the node's `GET /fetch` (and refused if larger). A
-Volume's entries include its root, and a Volume is at most 1 MiB. An
+Volume's entries include its root, and a Volume is at most 1 MiB and 1 KiB
+(a 1 MiB chunk of a file and its block's framing). An
 upload that does not fit in what is left of `--storage-budget` is refused
 (`overBudget`). The answer's `needed` is the coins of work still owed on each
 chain `--storage-rate <chain>=<bytesPerCoin>` prices; `credit` is the bytes
