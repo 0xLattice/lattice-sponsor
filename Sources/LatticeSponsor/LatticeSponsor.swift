@@ -634,14 +634,15 @@ actor Sponsor {
     }
 
 
-    /// A random identifier and its MAC under `tokenKey`, in hex.
+    /// A random identifier and its MAC under `tokenKey`, in hex: 16 bytes
+    /// then 32.
     private func issueToken() -> String {
         let identifier = (0..<16).map { _ in UInt8.random(in: .min ... .max) }
         return Self.hex(identifier) + Self.hex(Array(mac(identifier)))
     }
 
     private func isIssued(_ token: String) -> Bool {
-        guard token.count == 64, let bytes = Data(hex: token) else { return false }
+        guard let bytes = Data(hex: token), bytes.count == 16 + 32 else { return false }
         return HMAC<SHA256>.isValidAuthenticationCode(
             Array(bytes.suffix(32)), authenticating: Array(bytes.prefix(16)), using: tokenKey
         )
