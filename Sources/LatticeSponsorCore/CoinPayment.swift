@@ -1,6 +1,7 @@
 // Coin payment: a transfer to the sponsor's --pay-to buys storage at the
-// sponsor's own rates, as work does. One of the transfer's signers claims it
-// for one upload, and it is credited once it is
+// sponsor's own rates, as work does, or adds to a fund (see Funds.swift). One
+// of the transfer's signers claims it for one upload, peer or fund, and it is
+// credited once it is
 // --coin-depth blocks deep in the node's canonical chain, read through the
 // node's explorer and transaction routes. Each transfer is credited once; the
 // transfers credited are kept in one JSON file.
@@ -13,7 +14,7 @@ import Lattice
 import LatticeNodeAPI
 
 /// `POST /pay`: a transfer on `chain`, claimed by one of its signers for an
-/// upload's storage.
+/// upload's storage, a peer's standing, or a fund.
 public struct CoinPayment: Codable, Sendable {
     public let chain: String
     public let txCID: String
@@ -23,24 +24,35 @@ public struct CoinPayment: Codable, Sendable {
     public let signature: String
     /// The upload's root, or else
     public let store: String?
-    /// the peer whose standing it raises.
+    /// the peer whose standing it raises, or else
     public let peer: String?
+    /// the prefixes of the fund it adds to.
+    public let fund: [String]?
 
-    public init(chain: String, txCID: String, signer: String, signature: String, store: String? = nil, peer: String? = nil) {
+    public init(
+        chain: String, txCID: String, signer: String, signature: String,
+        store: String? = nil, peer: String? = nil, fund: [String]? = nil
+    ) {
         self.chain = chain
         self.txCID = txCID
         self.signer = signer
         self.signature = signature
         self.store = store
         self.peer = peer
+        self.fund = fund
     }
 
     public var chainPath: [String] { chain.components(separatedBy: "/") }
 
     /// What the signer signs, with the scheme Lattice signs transactions with
     /// (`CryptoUtils.sign`): it binds the transfer to one chain and one
-    /// upload or peer.
+    /// upload, peer or fund. A fund's prefixes are signed normalized, one per
+    /// line.
     public var message: String {
+        if let fund {
+            let prefixes = (try? FundLedger.normalize(fund)) ?? fund
+            return "lattice-sponsor-pay-fund:v1:\(chain):\(txCID):\(prefixes.joined(separator: "\n"))"
+        }
         if let peer { return "lattice-sponsor-pay-serving:v1:\(chain):\(txCID):\(peer)" }
         return "lattice-sponsor-pay:v1:\(chain):\(txCID):\(store ?? "")"
     }
@@ -82,7 +94,10 @@ extension SponsorNode {
     /// claimed by one of its signers. Each refusal is named.
     public func verify(_ payment: CoinPayment, payTo: String, depth: UInt64) async throws -> UInt64 {
         try ServingCredit.check(peer: payment.peer, store: payment.store)
-        guard (payment.peer == nil) != (payment.store == nil) else { throw SponsorRefusal.draft("pay names a store or a peer") }
+        guard [payment.peer != nil, payment.store != nil, payment.fund != nil].filter({ $0 }).count == 1 else {
+            throw SponsorRefusal.draft("pay names one of a store, a peer or a fund")
+        }
+        if let fund = payment.fund { _ = try FundLedger.normalize(fund) }
         let cid = payment.txCID
         guard !cid.isEmpty, cid.utf8.count <= 128, cid.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) }) else {
             throw SponsorRefusal.draft("txCID is not a CID")
