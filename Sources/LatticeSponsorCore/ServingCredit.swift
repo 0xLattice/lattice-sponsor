@@ -49,8 +49,13 @@ public struct SponsorTerms: Codable, Sendable {
     /// Bytes per coin, by chain path.
     public let storageRates: [String: Int]
     public let servingRates: [String: Int]
+    /// Coins drawn per funded transaction, by chain path, as decimal strings.
+    public let fundPrices: [String: String]
 
-    public init(payTo: String?, depth: UInt64, storageRates: [[String]: Int], servingRates: [[String]: Int]) {
+    public init(
+        payTo: String?, depth: UInt64, storageRates: [[String]: Int], servingRates: [[String]: Int],
+        fundPrices: [[String]: UInt64] = [:]
+    ) {
         func named(_ rates: [[String]: Int]) -> [String: Int] {
             Dictionary(uniqueKeysWithValues: rates.map { ($0.key.joined(separator: "/"), $0.value) })
         }
@@ -58,6 +63,7 @@ public struct SponsorTerms: Codable, Sendable {
         self.depth = depth
         self.storageRates = named(storageRates)
         self.servingRates = named(servingRates)
+        self.fundPrices = Dictionary(uniqueKeysWithValues: fundPrices.map { ($0.key.joined(separator: "/"), String($0.value)) })
     }
 }
 

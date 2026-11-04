@@ -85,6 +85,15 @@ private func claim(store: String = "root", key: String = payer.privateKey, signe
     )
 }
 
+/// `tx1` claimed by the payer for the fund of `prefixes`.
+private func claim(fund prefixes: [String]) -> CoinPayment {
+    let unsigned = CoinPayment(chain: "Nexus/Market", txCID: "tx1", signer: payerAddress, signature: "", fund: prefixes)
+    return CoinPayment(
+        chain: "Nexus/Market", txCID: "tx1", signer: payerAddress,
+        signature: CryptoUtils.sign(message: unsigned.message, privateKeyHex: payer.privateKey)!, fund: prefixes
+    )
+}
+
 final class CoinPaymentTests: XCTestCase {
     private var file: URL!
 
@@ -154,6 +163,39 @@ final class CoinPaymentTests: XCTestCase {
             let refused = await refusal(FakeChain(actions: actions), claim())
             XCTAssertEqual(refused, .noPayment)
         }
+    }
+
+    /// A transfer adds its coins to the fund it names, once.
+    func testATransferFundsItsPrefixesOnce() async throws {
+        let fundsFile = FileManager.default.temporaryDirectory.appendingPathComponent("funds-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: fundsFile) }
+        var funds = try FundLedger(prices: [market: 1], file: fundsFile)
+        var payments = try PaymentLedger(file: file)
+        let payment = claim(fund: ["profile/", "comment/"])
+        XCTAssertEqual(payment.message, "lattice-sponsor-pay-fund:v1:Nexus/Market:tx1:comment/\nprofile/", "signed normalized")
+
+        try payments.claim(payment.txCID)
+        let coins = try await FakeChain().node.verify(payment, payTo: payTo, depth: 6)
+        try payments.release(payment.txCID, credit: true)
+        let prefixes = try FundLedger.normalize(payment.fund!)
+        XCTAssertEqual(try funds.credit(prefixes, coins: coins, on: market), 4)
+        XCTAssertThrowsError(try payments.claim(payment.txCID), "a replay credits nothing") {
+            XCTAssertEqual($0 as? SponsorRefusal, .alreadyCredited)
+        }
+        XCTAssertEqual(funds.balance(of: prefixes, on: market), 4)
+
+        // The signature binds the fund.
+        let moved = CoinPayment(chain: "Nexus/Market", txCID: "tx1", signer: payerAddress, signature: payment.signature, fund: ["other/"])
+        let refused = await refusal(FakeChain(), moved)
+        XCTAssertEqual(refused, .invalidSignature)
+    }
+
+    func testAPaymentNamesOneOfAStoreAPeerOrAFund() async throws {
+        let both = CoinPayment(chain: "Nexus/Market", txCID: "tx1", signer: payerAddress, signature: "", store: "root", fund: ["a/"])
+        let refused = await refusal(FakeChain(), both)
+        XCTAssertEqual(refused, .draft("pay names one of a store, a peer or a fund"))
+        let empty = await refusal(FakeChain(), claim(fund: []))
+        XCTAssertEqual(empty, .draft("a fund names 1 to 8 prefixes"))
     }
 
     /// 4 coins at 16 bytes per coin pay for a 60-byte upload, which is pinned.

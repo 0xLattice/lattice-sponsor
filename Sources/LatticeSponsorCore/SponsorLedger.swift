@@ -138,6 +138,11 @@ public enum SponsorRefusal: Error, Sendable, Equatable {
     case noPayment
     /// The transaction is already credited, or being checked.
     case alreadyCredited
+    /// The sponsor sets no fund price on the chain.
+    case noFundPrice
+    /// With --funded-only, no fund named pays for the transaction: it writes
+    /// a key outside the fund's prefixes, or the fund is short of the price.
+    case notFunded
 }
 
 public struct SponsorLedger: Sendable {
