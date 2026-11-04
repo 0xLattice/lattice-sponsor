@@ -46,9 +46,8 @@ lattice-sponsor \
   [Serving](#serving)).
 - `--pay-to` lets coin buy storage or serving too (see
   [Paying in coin](#paying-in-coin)), with `--coin-depth`.
-- `--fund-price` (with `--pay-to`) lets a payer prepay coin for the
-  transactions under some key prefixes (see [Funds](#funds)), with
-  `--funded-only`.
+- `--funds` lets a site lend the sponsor float for the transactions under
+  some key prefixes (see [Funds](#funds)), with `--funded-only`.
 
 Credit is held in memory, so a restart forfeits unspent shares. A chain's
 reward schedule is read once, so a chain re-hosted under the same path with a
@@ -70,9 +69,9 @@ JSON; 64-bit integers are decimal strings, and targets and work are hex.
 | `POST /sponsor` | `{client, transaction, pay?, fund?}` | the co-signed transaction |
 | `POST /store` | `{root, volumes: [{cid, entries?, bytes?}]}` | `{root, bytes, needed, credit, stored}` |
 | `GET /store/:root` | | `{root, bytes, needed, credit, stored}` |
-| `POST /pay` | `{chain, txCID, signer, signature, store \| peer \| fund}` | `{bytes}` bought, and a fund's `balance` |
-| `GET /fund?chain=<path>&prefix=<p>...` | | `{balance, price}` |
-| `GET /terms` | | `{payTo, depth, storageRates, servingRates, fundPrices}` |
+| `POST /pay` | `{chain, txCID, signer, signature, store \| peer \| fund}` | `{bytes}` bought, and a fund's `deposit` |
+| `GET /fund?chain=<path>&prefix=<p>...` | | `{deposit, held}` |
+| `GET /terms` | | `{payTo, depth, storageRates, servingRates, fundTo?}` |
 
 With a `pay`, the sponsor credits the client `pay` within the transaction, and
 debits itself the fee plus `pay`. The client's own debits net against that
@@ -148,36 +147,45 @@ and the storage rates.
 
 ## Funds
 
-A fund is coin a payer prepays so the sponsor's service on some transactions
-is paid for: a site owner who runs no node, say, pays for its readers'
-transactions. Clients still buy each fee with work, as always; the fund pays
-the operator on top, as its income for sponsoring them.
+A fund is float a site lends the sponsor, so that one operator's coin does
+not bound how many sites it sponsors. Every fee the sponsor signs is held
+against its key's balance until it is mined; a fund's deposit sits in that
+balance, and holds the fees of its own site's transactions. With
+`--funded-only` the operator puts up no float at all: every transaction it
+signs is held against a site's deposit.
+
+A fund is not a fee or a payment to the operator, and nothing is drawn from
+it. Readers still pay for each fee with work, exactly as without a fund; that
+work earns the sponsor's key the template's rewards, which repay the fees, so
+on average a deposit stays the site's.
 
 A fund is named by its key prefixes: 1 to 8 non-empty strings of at most 128
 bytes, without a newline, compared as bytes. The sponsor sorts them by their
 UTF-8 bytes and drops repeats, so `["b/", "a/"]` and `["a/", "b/", "a/"]` are
 one fund. A fund is kept per chain.
 
-With `--fund-price <chain>=<coins>` (repeatable) and `--pay-to`, a payer sends
-coins to `--pay-to` on that chain and claims the transfer with `POST /pay`,
-naming `fund: [prefix, ...]` instead of `store` or `peer`, as in
-[Paying in coin](#paying-in-coin). `signature` is over
+With `--funds`, a site sends coins to the sponsor's own address (`fundTo` in
+`GET /terms`) and claims the transfer with `POST /pay`, naming
+`fund: [prefix, ...]` instead of `store` or `peer`, as in
+[Paying in coin](#paying-in-coin); `--pay-to` is not needed, and a transfer to
+any other address funds nothing. `signature` is over
 `lattice-sponsor-pay-fund:v1:<chain>:<txCID>:<prefixes>`, the prefixes
-normalized and joined by `\n`. What the transaction pays `--pay-to`, net, is
-added to the fund's balance, once per transaction; the answer is
-`{bytes: "0", balance}`. A chain without a price is refused `noFundPrice`.
-`GET /fund?chain=<path>&prefix=<p>&prefix=<q>` answers `{balance, price}`,
-and `GET /terms` lists `fundPrices`. Balances are kept in
-`lattice-sponsor-funds.json` beside `--storage-file`, so they survive a
-restart.
+normalized and joined by `\n`. What the transaction pays the sponsor, net, is
+added to the fund's deposit, once per transaction; the answer is
+`{bytes: "0", deposit}`. Deposits are kept in `lattice-sponsor-funds.json`
+beside `--storage-file`, so they survive a restart. There is no withdrawal
+yet.
 
-A client names the fund on `POST /sponsor` as `fund: [prefix, ...]`. On a
-chain with a price, the fund pays for the transaction when the transaction
-writes at least one key and every key it writes starts with one of the fund's
-prefixes, and the fund holds at least the price: the price is drawn as the
-sponsor co-signs. Otherwise the transaction is sponsored as before, drawing
-nothing, or with `--funded-only`, refused `notFunded` (402). A `fund` on a
-chain without a price is ignored.
+A reader names the fund on `POST /sponsor` as `fund: [prefix, ...]`. The fund
+backs the transaction when the transaction writes at least one key, every key
+it writes starts with one of the fund's prefixes, and the fee and `pay` fit in
+the deposit beside what the fund already holds: the fees and pays signed under
+it whose hold has not expired. A backed transaction is held against the fund;
+any other is held against the operator's own float, as without funds, or with
+`--funded-only`, refused `notFunded` (402). Either way the key's whole balance
+must still cover every hold (`insufficientFloat`).
+`GET /fund?chain=<path>&prefix=<p>&prefix=<q>` answers `{deposit, held}`;
+room for more is `deposit - held`.
 
 ## What it risks
 
@@ -193,12 +201,15 @@ blocks, but a client may submit its body later than that. The sponsor never
 pays more than one fee and pay per signature, so the cost is another client's
 sponsored transaction failing on an empty float.
 
-A fund can be drawn only by transactions that write nothing but keys under its
-prefixes, so a payer pays for no one else's keys. But anyone may fund any
-prefixes, and anyone who writes under them draws from the fund: a payer's
-prefixes should be ones only its own users write. The operator keeps the
-balances and meters the draws, and a payer trusts it to do so honestly, as an
-uploader trusts a storage sponsor.
+A fund's deposit joins the key's one balance, so its luck is shared: blocks
+the readers' work fails to win, and shares withheld by any client, cost every
+deposit and the operator's float alike, not the site whose readers caused
+them. A fund backs only transactions that write nothing but keys under its
+prefixes, but anyone may fund any prefixes and anyone who writes under them
+uses the fund's room: a site's prefixes should be ones only its own readers
+write. Deposits cannot be withdrawn yet. The operator holds the coin and keeps
+the deposits, and a site trusts it to do so honestly, as an uploader trusts a
+storage sponsor.
 
 ## Development
 

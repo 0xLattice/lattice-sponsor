@@ -1,7 +1,7 @@
 // Coin payment: a transfer to the sponsor's --pay-to buys storage at the
-// sponsor's own rates, as work does, or adds to a fund (see Funds.swift). One
-// of the transfer's signers claims it for one upload, peer or fund, and it is
-// credited once it is
+// sponsor's own rates, as work does, and one to the sponsor's own account adds
+// to a fund (see Funds.swift). One of the transfer's signers claims it for one
+// upload, peer or fund, and it is credited once it is
 // --coin-depth blocks deep in the node's canonical chain, read through the
 // node's explorer and transaction routes. Each transfer is credited once; the
 // transfers credited are kept in one JSON file.
@@ -43,6 +43,13 @@ public struct CoinPayment: Codable, Sendable {
     }
 
     public var chainPath: [String] { chain.components(separatedBy: "/") }
+
+    /// The account the transfer must pay: for a fund, the sponsor's own,
+    /// since a fund's coin is float lent to the sponsor's key; for
+    /// storage or serving, --pay-to, if set.
+    public func recipient(payTo: String?, sponsor: String) -> String? {
+        fund != nil ? sponsor : payTo
+    }
 
     /// What the signer signs, with the scheme Lattice signs transactions with
     /// (`CryptoUtils.sign`): it binds the transfer to one chain and one

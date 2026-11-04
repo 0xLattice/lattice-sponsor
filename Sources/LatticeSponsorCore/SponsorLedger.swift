@@ -138,10 +138,10 @@ public enum SponsorRefusal: Error, Sendable, Equatable {
     case noPayment
     /// The transaction is already credited, or being checked.
     case alreadyCredited
-    /// The sponsor sets no fund price on the chain.
-    case noFundPrice
+    /// The sponsor takes no funds.
+    case noFunds
     /// With --funded-only, no fund named pays for the transaction: it writes
-    /// a key outside the fund's prefixes, or the fund is short of the price.
+    /// a key outside the fund's prefixes, or the fund is short of the fee.
     case notFunded
 }
 
@@ -164,7 +164,9 @@ public struct SponsorLedger: Sendable {
     private var submitted: Set<ShareKey> = []
     private var credits: [CreditKey: (value: UInt256, lastShare: Int64)] = [:]
     private var sold: [BlockKey: UInt256] = [:]
-    private var commitments: [(chainPath: [String], fee: UInt64, until: Int64)] = []
+    /// Fees signed and held against the balance, each tagged with the fund
+    /// whose deposit backs it, if one does.
+    private var commitments: [(chainPath: [String], fee: UInt64, until: Int64, fund: FundID?)] = []
     private var lastID: UInt64 = 0
 
     private struct ShareKey: Hashable {
@@ -346,9 +348,11 @@ public struct SponsorLedger: Sendable {
     /// against the sponsor's `balance` there until `holdUntil`: a signed fee
     /// not yet mined does not show in the balance. The caller signs only
     /// after this returns. `fee` is everything the body debits the sponsor:
-    /// the fee and any payment it makes for the client.
+    /// the fee and any payment it makes for the client. With a `fund`, the
+    /// hold also counts against that fund's deposit (see `held(by:now:)`).
     public mutating func commit(
-        client: String, fee: UInt64, on chainPath: [String], balance: UInt64, holdUntil: Int64, now: Int64
+        client: String, fee: UInt64, on chainPath: [String], balance: UInt64, holdUntil: Int64, now: Int64,
+        fund: FundID? = nil
     ) throws {
         let key = CreditKey(client: client, chainPath: chainPath)
         let cost = UInt256(fee) * Self.unit
@@ -359,7 +363,14 @@ public struct SponsorLedger: Sendable {
         }
         guard committed <= UInt256(balance) else { throw SponsorRefusal.insufficientFloat }
         credits[key] = (held.value - cost, held.lastShare)
-        commitments.append((chainPath, fee, holdUntil))
+        commitments.append((chainPath, fee, holdUntil, fund))
+    }
+
+    /// What `fund` backs now: its commitments not yet expired.
+    public func held(by fund: FundID, now: Int64) -> UInt256 {
+        commitments.reduce(UInt256.zero) { sum, commitment in
+            commitment.fund == fund && commitment.until > now ? sum + UInt256(commitment.fee) : sum
+        }
     }
 
     private mutating func prune(now: Int64) {
