@@ -184,6 +184,45 @@ final class SponsorLedgerTests: XCTestCase {
         try ledger.commit(client: "b", fee: 4, on: nexus, balance: 8, holdUntil: 600_000, now: 3)
     }
 
+    /// A fund's deposit backs holds up to its size while they last, and is
+    /// never drawn: room comes back as holds expire.
+    func testAFundBacksHoldsUpToItsDepositUntilTheyExpire() throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("funds-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: file) }
+        var funds = try FundLedger(file: file)
+        let fund = FundID(["comment/"], on: nexus)
+        _ = try funds.credit(fund, coins: 5)
+
+        var ledger = ledger()
+        let a = try ledger.assign(client: "a", on: nexus, now: 0)
+        for nonce in 0..<2 {
+            _ = try ledger.credit(assignment: a.id, nonce: UInt64(nonce), hash: UInt256(1), now: 1)
+        }
+        let comment = draft(signer: "c", actions: [Action(key: "comment/1", oldValue: nil, newValue: "hi")])
+        func backer(_ total: UInt64, now: Int64 = 2, fundedOnly: Bool = false) throws -> FundID? {
+            try funds.backer(for: comment, fund: ["comment/"], total: total, ledger: ledger, now: now, fundedOnly: fundedOnly)
+        }
+
+        let backed = try XCTUnwrap(try backer(3))
+        try ledger.commit(client: "a", fee: 3, on: nexus, balance: 100, holdUntil: 1_000, now: 2, fund: backed)
+        XCTAssertEqual(ledger.held(by: fund, now: 2), UInt256(3))
+        XCTAssertNil(try backer(3), "3 held and 3 more is over the 5 deposited")
+        XCTAssertThrowsError(try backer(3, fundedOnly: true)) { XCTAssertEqual($0 as? SponsorRefusal, .notFunded) }
+        XCTAssertEqual(try backer(2), fund, "exactly the deposit")
+
+        // An unbacked hold is the operator's, not the fund's.
+        try ledger.commit(client: "a", fee: 1, on: nexus, balance: 100, holdUntil: 1_000, now: 2)
+        XCTAssertEqual(ledger.held(by: fund, now: 2), UInt256(3))
+        // The whole key's float still bounds everything.
+        XCTAssertThrowsError(
+            try ledger.commit(client: "a", fee: 2, on: nexus, balance: 5, holdUntil: 1_000, now: 2, fund: fund)
+        ) { XCTAssertEqual($0 as? SponsorRefusal, .insufficientFloat) }
+
+        XCTAssertEqual(ledger.held(by: fund, now: 1_000), .zero, "expired")
+        XCTAssertEqual(try backer(5, now: 1_000), fund)
+        XCTAssertEqual(funds.deposit(of: fund), 5, "sponsoring draws nothing")
+    }
+
     /// Only one block per height can be the chain's: the credit a height
     /// backs, over every client, stops at its reward.
     func testCreditAtAHeightStopsAtItsBlocksReward() throws {

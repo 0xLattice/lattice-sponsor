@@ -1,50 +1,52 @@
-// Funds: coin a payer prepays so the sponsor's service on some transactions
-// is paid for. A fund is named by its key prefixes, and only a transaction
-// whose every action key starts with one of them draws from it: a payer pays
-// for its own keys' transactions and no one else's. Clients still buy the fee
-// with work; a fund pays the operator --fund-price per transaction on top, as
-// its income for the service. Anyone may fund any prefixes. The balances are
-// kept in one JSON file.
+// Funds: float a payer lends the sponsor, so one operator's coin does not
+// bound how many sites it sponsors. A payer deposits coin to the sponsor's
+// own account, under a fund named by key prefixes. A sponsored transaction
+// that names the fund and writes only keys under its prefixes is held against
+// the fund's deposit instead of the operator's own float: the fund's fees
+// signed and not yet expired stay within its deposit. Nothing is drawn from
+// a deposit. Clients still buy every fee with work, which repays it through
+// the template's rewards to the sponsor's key, so on average a deposit stays
+// the payer's. Anyone may fund any prefixes. Deposits are kept in one JSON
+// file; there is no withdrawal yet.
 
 import Foundation
 import Lattice
 import LatticeNodeAPI
+import UInt256
+
+/// One fund on one chain. Prefixes are compared as bytes, as the chain
+/// compares keys: two spellings of one character are two prefixes.
+public struct FundID: Hashable, Sendable {
+    public let chainPath: [String]
+    let prefixes: [Data]
+
+    /// `prefixes` normalized (`FundLedger.normalize`).
+    public init(_ prefixes: [String], on chainPath: [String]) {
+        self.chainPath = chainPath
+        self.prefixes = prefixes.map { Data($0.utf8) }
+    }
+}
 
 public struct FundLedger: Sendable {
     public static let mostPrefixes = 8
     public static let longestPrefix = 128
 
-    /// Coins drawn per funded transaction, on each chain that prices funds.
-    public let prices: [[String]: UInt64]
     let file: URL
-    private var balances: [Key: UInt64] = [:]
-
-    /// Prefixes are compared as bytes, as the chain compares keys: two
-    /// spellings of one character are two prefixes.
-    private struct Key: Hashable {
-        let chainPath: [String]
-        let prefixes: [Data]
-
-        init(_ prefixes: [String], on chainPath: [String]) {
-            self.chainPath = chainPath
-            self.prefixes = prefixes.map { Data($0.utf8) }
-        }
-    }
+    private var deposits: [FundID: UInt64] = [:]
 
     private struct Record: Codable {
         let chain: String
         let prefixes: [String]
-        @DecimalString var balance: UInt64
+        @DecimalString var deposit: UInt64
     }
 
-    /// Read the balances `file` keeps, if it exists.
-    public init(prices: [[String]: UInt64], file: URL) throws {
-        self.prices = prices
+    /// Read the deposits `file` keeps, if it exists.
+    public init(file: URL) throws {
         self.file = file
         if FileManager.default.fileExists(atPath: file.path) {
             for record in try JSONDecoder().decode([Record].self, from: Data(contentsOf: file)) {
                 let chainPath = record.chain.components(separatedBy: "/")
-                balances[Key(try Self.normalize(record.prefixes), on: chainPath)] = record.balance
+                deposits[FundID(try Self.normalize(record.prefixes), on: chainPath)] = record.deposit
             }
         }
     }
@@ -70,7 +72,7 @@ public struct FundLedger: Sendable {
         return unique.map { String(decoding: $0, as: UTF8.self) }
     }
 
-    /// Whether a fund of `prefixes` pays for `body`: it writes at least one
+    /// Whether a fund of `prefixes` may back `body`: it writes at least one
     /// key, and every key it writes starts with one of them.
     public static func covers(_ body: TransactionBody, prefixes: [String]) -> Bool {
         !body.actions.isEmpty && body.actions.allSatisfy { action in
@@ -78,63 +80,44 @@ public struct FundLedger: Sendable {
         }
     }
 
-    public func price(on chainPath: [String]) throws -> UInt64 {
-        guard let price = prices[chainPath] else { throw SponsorRefusal.noFundPrice }
-        return price
+    public func deposit(of fund: FundID) -> UInt64 {
+        deposits[fund] ?? 0
     }
 
-    /// The coins left in the fund of normalized `prefixes` on `chainPath`.
-    public func balance(of prefixes: [String], on chainPath: [String]) -> UInt64 {
-        balances[Key(prefixes, on: chainPath)] ?? 0
-    }
-
-    /// The fund that pays for sponsoring `draft`, normalized, or nil to
-    /// sponsor it as before, unpaid. A chain without a price ignores `fund`;
-    /// on one with a price, `fundedOnly` refuses a draft no fund pays for.
-    public func payer(for draft: TransactionBody, fund: [String]?, fundedOnly: Bool) throws -> [String]? {
-        guard let price = prices[draft.chainPath] else { return nil }
+    /// The fund that holds `total` (the fee and any `pay`) for sponsoring
+    /// `draft`, or nil to hold it against the operator's own float:
+    /// `fundedOnly` refuses a draft no fund backs. A fund backs a draft it
+    /// covers while its unexpired holds and `total` fit in its deposit.
+    public func backer(
+        for draft: TransactionBody, fund: [String]?, total: UInt64,
+        ledger: SponsorLedger, now: Int64, fundedOnly: Bool
+    ) throws -> FundID? {
         if let fund {
             let prefixes = try Self.normalize(fund)
-            if Self.covers(draft, prefixes: prefixes), balance(of: prefixes, on: draft.chainPath) >= price {
-                return prefixes
+            let id = FundID(prefixes, on: draft.chainPath)
+            if Self.covers(draft, prefixes: prefixes),
+               ledger.held(by: id, now: now) + UInt256(total) <= UInt256(deposit(of: id)) {
+                return id
             }
         }
         guard !fundedOnly else { throw SponsorRefusal.notFunded }
         return nil
     }
 
-    /// Draw the chain's price from the fund of normalized `prefixes`.
-    public mutating func draw(_ prefixes: [String], on chainPath: [String]) throws {
-        let key = Key(prefixes, on: chainPath)
-        let price = try price(on: chainPath)
-        guard let balance = balances[key], balance >= price else { throw SponsorRefusal.notFunded }
-        var next = balances
-        next[key] = balance - price
-        try save(next)
-        balances = next
-    }
-
-    /// Add `coins` to the fund of normalized `prefixes`, saturating, and
-    /// return its balance.
-    public mutating func credit(_ prefixes: [String], coins: UInt64, on chainPath: [String]) throws -> UInt64 {
-        _ = try price(on: chainPath)
-        let key = Key(prefixes, on: chainPath)
-        let (sum, overflow) = (balances[key] ?? 0).addingReportingOverflow(coins)
-        var next = balances
-        next[key] = overflow ? .max : sum
-        try save(next)
-        balances = next
-        return next[key]!
-    }
-
-    private func save(_ balances: [Key: UInt64]) throws {
-        let records = balances.filter { $0.value > 0 }.map { key, balance in
+    /// Add `coins` to `fund`'s deposit, saturating, and return it.
+    public mutating func credit(_ fund: FundID, coins: UInt64) throws -> UInt64 {
+        let (sum, overflow) = deposit(of: fund).addingReportingOverflow(coins)
+        var next = deposits
+        next[fund] = overflow ? .max : sum
+        let records = next.map { id, deposit in
             Record(
-                chain: key.chainPath.joined(separator: "/"),
-                prefixes: key.prefixes.map { String(decoding: $0, as: UTF8.self) },
-                balance: balance
+                chain: id.chainPath.joined(separator: "/"),
+                prefixes: id.prefixes.map { String(decoding: $0, as: UTF8.self) },
+                deposit: deposit
             )
         }.sorted { ($0.chain, $0.prefixes.joined(separator: "\n")) < ($1.chain, $1.prefixes.joined(separator: "\n")) }
         try JSONEncoder().encode(records).write(to: file, options: .atomic)
+        deposits = next
+        return next[fund]!
     }
 }

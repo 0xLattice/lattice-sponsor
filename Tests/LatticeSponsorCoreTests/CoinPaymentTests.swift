@@ -165,29 +165,50 @@ final class CoinPaymentTests: XCTestCase {
         }
     }
 
-    /// A transfer adds its coins to the fund it names, once.
+    /// A transfer to the sponsor's own account adds its coins to the fund it
+    /// names, once.
     func testATransferFundsItsPrefixesOnce() async throws {
         let fundsFile = FileManager.default.temporaryDirectory.appendingPathComponent("funds-\(UUID().uuidString).json")
         defer { try? FileManager.default.removeItem(at: fundsFile) }
-        var funds = try FundLedger(prices: [market: 1], file: fundsFile)
+        var funds = try FundLedger(file: fundsFile)
         var payments = try PaymentLedger(file: file)
         let payment = claim(fund: ["profile/", "comment/"])
         XCTAssertEqual(payment.message, "lattice-sponsor-pay-fund:v1:Nexus/Market:tx1:comment/\nprofile/", "signed normalized")
+        // Here `payTo` is the sponsor's own address, and --pay-to is another.
+        let recipient = try XCTUnwrap(payment.recipient(payTo: "elsewhere", sponsor: payTo))
+        XCTAssertEqual(recipient, payTo)
 
         try payments.claim(payment.txCID)
-        let coins = try await FakeChain().node.verify(payment, payTo: payTo, depth: 6)
+        let coins = try await FakeChain().node.verify(payment, payTo: recipient, depth: 6)
         try payments.release(payment.txCID, credit: true)
-        let prefixes = try FundLedger.normalize(payment.fund!)
-        XCTAssertEqual(try funds.credit(prefixes, coins: coins, on: market), 4)
+        let fund = FundID(try FundLedger.normalize(payment.fund!), on: market)
+        XCTAssertEqual(try funds.credit(fund, coins: coins), 4)
         XCTAssertThrowsError(try payments.claim(payment.txCID), "a replay credits nothing") {
             XCTAssertEqual($0 as? SponsorRefusal, .alreadyCredited)
         }
-        XCTAssertEqual(funds.balance(of: prefixes, on: market), 4)
+        XCTAssertEqual(funds.deposit(of: fund), 4)
 
         // The signature binds the fund.
         let moved = CoinPayment(chain: "Nexus/Market", txCID: "tx1", signer: payerAddress, signature: payment.signature, fund: ["other/"])
         let refused = await refusal(FakeChain(), moved)
         XCTAssertEqual(refused, .invalidSignature)
+    }
+
+    /// A fund is paid to the sponsor's own account; a transfer to any other,
+    /// --pay-to included, funds nothing.
+    func testAFundTransferToAnotherAccountIsRefused() async throws {
+        let sponsor = CryptoUtils.createAddress(from: CryptoUtils.generateKeyPair().publicKey)
+        let payment = claim(fund: ["comment/"])
+        let recipient = try XCTUnwrap(payment.recipient(payTo: payTo, sponsor: sponsor))
+        XCTAssertEqual(recipient, sponsor)
+        do {
+            _ = try await FakeChain().node.verify(payment, payTo: recipient, depth: 6)
+            XCTFail("the transfer pays payTo, not the sponsor")
+        } catch {
+            XCTAssertEqual(error as? SponsorRefusal, .noPayment)
+        }
+        XCTAssertEqual(claim().recipient(payTo: payTo, sponsor: sponsor), payTo, "storage still pays --pay-to")
+        XCTAssertNil(claim().recipient(payTo: nil, sponsor: sponsor))
     }
 
     func testAPaymentNamesOneOfAStoreAPeerOrAFund() async throws {

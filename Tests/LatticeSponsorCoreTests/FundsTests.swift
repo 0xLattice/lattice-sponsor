@@ -1,6 +1,7 @@
 import Foundation
 import XCTest
 import Lattice
+import UInt256
 @testable import LatticeSponsorCore
 
 private let site = ["Nexus", "Riposte"]
@@ -51,65 +52,48 @@ final class FundsTests: XCTestCase {
         XCTAssertFalse(FundLedger.covers(body(["e\u{301}/1"]), prefixes: ["\u{E9}/"]), "compared as bytes")
     }
 
-    func testACoveredFundedDraftDrawsThePrice() throws {
-        var funds = try FundLedger(prices: [site: 3], file: file)
+    func testFundedOnlyRefusesWhatNoFundBacks() throws {
+        var funds = try FundLedger(file: file)
         let fund = try FundLedger.normalize(["comment/"])
-        XCTAssertEqual(try funds.credit(fund, coins: 7, on: site), 7)
+        _ = try funds.credit(FundID(fund, on: site), coins: 10)
+        let ledger = SponsorLedger(shareTarget: UInt256(1))
 
-        let draft = body(["comment/1"])
-        let payer = try XCTUnwrap(try funds.payer(for: draft, fund: ["comment/", "comment/"], fundedOnly: true))
-        try funds.draw(payer, on: site)
-        XCTAssertEqual(funds.balance(of: fund, on: site), 4)
-        try funds.draw(payer, on: site)
-        XCTAssertEqual(funds.balance(of: fund, on: site), 1)
-
-        // Underfunded: refused with --funded-only, sponsored undrawn without.
-        XCTAssertThrowsError(try funds.payer(for: draft, fund: fund, fundedOnly: true)) {
-            XCTAssertEqual($0 as? SponsorRefusal, .notFunded)
-        }
-        XCTAssertNil(try funds.payer(for: draft, fund: fund, fundedOnly: false))
-        XCTAssertThrowsError(try funds.draw(fund, on: site)) { XCTAssertEqual($0 as? SponsorRefusal, .notFunded) }
-        XCTAssertEqual(funds.balance(of: fund, on: site), 1)
-    }
-
-    func testFundedOnlyRefusesWhatNoFundPaysForOnAPricedChain() throws {
-        var funds = try FundLedger(prices: [site: 3], file: file)
-        let fund = try FundLedger.normalize(["comment/"])
-        _ = try funds.credit(fund, coins: 10, on: site)
-
-        for (draft, named) in [
-            (body(["comment/1"]), nil),
-            (body(["other/1"]), fund),
-            (body(["comment/1", "other/1"]), fund),
-            (body([]), fund),
-            (body(["comment/1"]), ["another/"]),
-        ] as [(TransactionBody, [String]?)] {
-            XCTAssertThrowsError(try funds.payer(for: draft, fund: named, fundedOnly: true)) {
+        XCTAssertEqual(
+            try funds.backer(for: body(["comment/1"]), fund: ["comment/", "comment/"], total: 10, ledger: ledger, now: 0, fundedOnly: true),
+            FundID(fund, on: site), "covered, and fits the deposit"
+        )
+        for (draft, named, total) in [
+            (body(["comment/1"]), nil, 1),
+            (body(["other/1"]), fund, 1),
+            (body(["comment/1", "other/1"]), fund, 1),
+            (body([]), fund, 1),
+            (body(["comment/1"]), ["another/"], 1),
+            (body(["comment/1"], chainPath: ["Nexus"]), fund, 1),
+            (body(["comment/1"]), fund, 11),
+        ] as [(TransactionBody, [String]?, UInt64)] {
+            XCTAssertThrowsError(try funds.backer(for: draft, fund: named, total: total, ledger: ledger, now: 0, fundedOnly: true)) {
                 XCTAssertEqual($0 as? SponsorRefusal, .notFunded)
             }
-            XCTAssertNil(try funds.payer(for: draft, fund: named, fundedOnly: false), "sponsored as before")
+            XCTAssertNil(
+                try funds.backer(for: draft, fund: named, total: total, ledger: ledger, now: 0, fundedOnly: false),
+                "held against the operator's float, as before"
+            )
         }
-        // A chain without a price ignores funds, --funded-only included.
-        XCTAssertNil(try funds.payer(for: body(["other/1"], chainPath: ["Nexus"]), fund: fund, fundedOnly: true))
-        XCTAssertNil(try funds.payer(for: body(["x"], chainPath: ["Nexus"]), fund: [], fundedOnly: true))
-        XCTAssertThrowsError(try funds.credit(fund, coins: 1, on: ["Nexus"])) {
-            XCTAssertEqual($0 as? SponsorRefusal, .noFundPrice)
-        }
-        XCTAssertEqual(funds.balance(of: fund, on: site), 10)
+        XCTAssertEqual(funds.deposit(of: FundID(fund, on: ["Nexus"])), 0, "a fund is kept per chain")
     }
 
-    func testBalancesSurviveARestart() throws {
-        var funds = try FundLedger(prices: [site: 2], file: file)
-        let one = try FundLedger.normalize(["comment/"])
-        let two = try FundLedger.normalize(["profile/", "comment/"])
-        _ = try funds.credit(one, coins: 5, on: site)
-        _ = try funds.credit(two, coins: UInt64.max, on: site)
-        XCTAssertEqual(try funds.credit(two, coins: 1, on: site), .max, "saturating")
-        try funds.draw(one, on: site)
+    func testDepositsSurviveARestart() throws {
+        var funds = try FundLedger(file: file)
+        let one = FundID(try FundLedger.normalize(["comment/"]), on: site)
+        let two = FundID(try FundLedger.normalize(["profile/", "comment/"]), on: site)
+        XCTAssertEqual(try funds.credit(one, coins: 5), 5)
+        _ = try funds.credit(two, coins: UInt64.max)
+        XCTAssertEqual(try funds.credit(two, coins: 1), .max, "saturating")
+        XCTAssertEqual(try funds.credit(one, coins: 2), 7)
 
-        let restarted = try FundLedger(prices: [site: 2], file: file)
-        XCTAssertEqual(restarted.balance(of: one, on: site), 3)
-        XCTAssertEqual(restarted.balance(of: two, on: site), .max)
-        XCTAssertEqual(restarted.balance(of: try FundLedger.normalize(["profile/"]), on: site), 0)
+        let restarted = try FundLedger(file: file)
+        XCTAssertEqual(restarted.deposit(of: one), 7)
+        XCTAssertEqual(restarted.deposit(of: two), .max)
+        XCTAssertEqual(restarted.deposit(of: FundID(["profile/"], on: site)), 0)
     }
 }

@@ -40,12 +40,14 @@
 // standing on the node: each accepted share, and each payment, is posted to
 // the node's POST /serving-credit at once, and a failed post loses it.
 //
-// With --fund-price, a transfer naming a `fund` (key prefixes) adds to that
-// fund, and each sponsored transaction that names the fund and writes only
-// keys under its prefixes draws the price from it, as the operator's income;
-// the client still buys the fee with work. With --funded-only, a chain with a
-// price sponsors only such transactions. The balances are kept beside
-// --storage-file.
+// With --funds, a transfer to the sponsor's own account naming a `fund` (key
+// prefixes) adds to that fund's deposit: float a site lends the sponsor. A
+// sponsored transaction that names the fund and writes only keys under its
+// prefixes is held against the deposit instead of the operator's own float,
+// while the fund's unexpired holds fit in it. Nothing is drawn from a deposit:
+// the client still buys the fee with work, which repays it. With
+// --funded-only, only such transactions are sponsored. Deposits are kept
+// beside --storage-file, and cannot be withdrawn yet.
 //
 // Routes (JSON, 64-bit integers as decimal strings, targets and work as hex):
 //   POST /work     {client?, chain?, pay?, store?|peer?} → a nonce range of the template
@@ -53,9 +55,9 @@
 //   POST /sponsor  {client, transaction, pay?, fund?} → the co-signed transaction
 //   POST /store    {root, volumes}                → the upload's status
 //   GET  /store/:root                             → {root, bytes, needed, credit, stored}
-//   POST /pay      {chain, txCID, signer, signature, store|peer|fund} → {bytes, balance?}
-//   GET  /fund?chain=<path>&prefix=<p>...         → {balance, price}
-//   GET  /terms                                   → {payTo, depth, storageRates, servingRates, fundPrices}
+//   POST /pay      {chain, txCID, signer, signature, store|peer|fund} → {bytes, deposit?}
+//   GET  /fund?chain=<path>&prefix=<p>...         → {deposit, held}
+//   GET  /terms                                   → {payTo, depth, storageRates, servingRates, fundTo?}
 //
 // A `pay` is coins the sponsor also credits the client in the transaction,
 // bought with the same shares as the fee, up to --most-pay (by default, the
@@ -116,16 +118,16 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
     @Option(name: .long, help: "A chain whose work or coin raises a peer's serving standing on the node, and the bytes one unit of it buys, as chain-path=bytesPerCoin (repeatable). Unset: no serving credit.")
     var servingRate: [String] = []
 
-    @Option(name: .long, help: "With --pay-to: a chain whose sponsored transactions a fund can pay for, and the coins each draws from it, as chain-path=coins (repeatable).")
-    var fundPrice: [String] = []
+    @Flag(name: .long, help: "Take funds: float a transfer to the sponsor's own account lends it for transactions under a fund's key prefixes.")
+    var funds = false
 
-    @Flag(name: .long, help: "With --fund-price: on a chain with a price, sponsor only transactions a named fund pays for.")
+    @Flag(name: .long, help: "With --funds: sponsor only transactions a named fund's deposit backs.")
     var fundedOnly = false
 
-    @Option(name: .long, help: "With --sell-storage, --serving-rate or --fund-price: the account a transfer pays to buy storage, serving or a fund in coin. Unset: no coin is taken.")
+    @Option(name: .long, help: "With --sell-storage or --serving-rate: the account a transfer pays to buy storage or serving in coin, at their rates. Unset: no coin is taken.")
     var payTo: String?
 
-    @Option(name: .long, help: "With --pay-to: blocks built on the block carrying a transfer before it is credited.")
+    @Option(name: .long, help: "With --pay-to or --funds: blocks built on the block carrying a transfer before it is credited.")
     var coinDepth: UInt64 = 6
 
     @Option(name: .long, help: "Listen address.")
@@ -142,12 +144,12 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
         let signer = try SponsorKey(file: key)
         let rpc = SponsorRPC(base: base, cookieFile: URL(fileURLWithPath: cookieFile))
         let cookie = URL(fileURLWithPath: cookieFile)
-        func parseRates(_ values: [String], flag: String, unit: String = "bytesPerCoin") throws -> [[String]: Int] {
+        func parseRates(_ values: [String], flag: String) throws -> [[String]: Int] {
             var rates: [[String]: Int] = [:]
             for value in values {
                 let parts = value.split(separator: "=", maxSplits: 1).map(String.init)
                 guard parts.count == 2, let bytesPerCoin = Int(parts[1]), bytesPerCoin > 0 else {
-                    throw ValidationError("\(flag) takes chain-path=\(unit), \(unit) at least 1")
+                    throw ValidationError("\(flag) takes chain-path=bytesPerCoin, bytesPerCoin at least 1")
                 }
                 let chainPath = parts[0].components(separatedBy: "/")
                 guard rates[chainPath] == nil else { throw ValidationError("\(flag) names \(parts[0]) twice") }
@@ -164,22 +166,17 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
         }
         let serving = ServingCredit(rates: try parseRates(servingRate, flag: "--serving-rate"))
         let node = SponsorNode(base: base, authorization: { rpcCookieAuthorization(file: cookie) })
-        let fundPrices = try parseRates(fundPrice, flag: "--fund-price", unit: "coins").mapValues { UInt64($0) }
-        guard fundPrices.isEmpty || payTo != nil else { throw ValidationError("--fund-price requires --pay-to") }
-        guard !fundedOnly || !fundPrices.isEmpty else { throw ValidationError("--funded-only requires --fund-price") }
+        guard !fundedOnly || funds else { throw ValidationError("--funded-only requires --funds") }
         let directory = URL(fileURLWithPath: storageFile).deletingLastPathComponent()
-        var payments: PaymentLedger?
-        var funds: FundLedger?
         if let payTo {
-            guard sellStorage || !serving.rates.isEmpty || !fundPrices.isEmpty else {
-                throw ValidationError("--pay-to requires --sell-storage, --serving-rate or --fund-price")
+            guard sellStorage || !serving.rates.isEmpty else {
+                throw ValidationError("--pay-to requires --sell-storage or --serving-rate")
             }
             guard CryptoUtils.isValidAddress(payTo) else { throw ValidationError("--pay-to is not an address") }
-            payments = try PaymentLedger(file: directory.appendingPathComponent("lattice-sponsor-payments.json"))
-            if !fundPrices.isEmpty {
-                funds = try FundLedger(prices: fundPrices, file: directory.appendingPathComponent("lattice-sponsor-funds.json"))
-            }
         }
+        let payments = payTo != nil || funds
+            ? try PaymentLedger(file: directory.appendingPathComponent("lattice-sponsor-payments.json")) : nil
+        let fundLedger = funds ? try FundLedger(file: directory.appendingPathComponent("lattice-sponsor-funds.json")) : nil
         let sponsor = Sponsor(
             ledger: SponsorLedger(shareTarget: minimumWorkTarget(work)),
             rpc: rpc,
@@ -193,7 +190,7 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
             payTo: payTo,
             coinDepth: coinDepth,
             payments: payments,
-            funds: funds,
+            funds: fundLedger,
             fundedOnly: fundedOnly
         )
         let templates = HTTPMiningCoordinatorNodeClient(
@@ -260,7 +257,7 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
                 )
             }
         }
-        if funds != nil {
+        if funds {
             router.get("fund") { request, _ in
                 let query = request.uri.queryParameters
                 return try await refusing {
@@ -289,7 +286,7 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
             }
         }
         router.get("terms") { _, _ in await sponsor.terms() }
-        if payTo != nil {
+        if payments != nil {
             router.post("pay") { request, context in
                 let input = try await request.decode(as: CoinPayment.self, context: context)
                 return try await refusing { try await sponsor.pay(input) }
@@ -381,14 +378,16 @@ struct PayResponse: ResponseEncodable {
     /// The bytes of storage or serving standing the transfer bought (none
     /// for a fund).
     @DecimalString var bytes: UInt64
-    /// For a fund, its balance after the transfer.
-    @OptionalDecimalString var balance: UInt64? = nil
+    /// For a fund, its deposit after the transfer.
+    @OptionalDecimalString var deposit: UInt64? = nil
 }
 
 struct FundResponse: ResponseEncodable {
-    @DecimalString var balance: UInt64
-    /// What one funded transaction draws on the chain.
-    @DecimalString var price: UInt64
+    /// The coins deposited, never drawn.
+    @DecimalString var deposit: UInt64
+    /// What the fund backs now: fees and pays signed under it and not yet
+    /// expired. Room for more is `deposit - held`.
+    @DecimalString var held: UInt64
 }
 
 extension SponsorTerms: ResponseEncodable {}
@@ -399,8 +398,8 @@ struct SponsorRequest: Decodable {
     let transaction: ContentBoundTransaction
     /// Coins the sponsor credits the client within the transaction.
     @OptionalDecimalString var pay: UInt64?
-    /// The prefixes of a fund that pays for the transaction, with
-    /// --fund-price.
+    /// The prefixes of a fund whose deposit backs the transaction, with
+    /// --funds.
     let fund: [String]?
 }
 
@@ -436,7 +435,7 @@ actor Sponsor {
     private let payTo: String?
     private let coinDepth: UInt64
     private var payments: PaymentLedger?
-    /// The funds, with --fund-price.
+    /// The funds, with --funds.
     private var funds: FundLedger?
     private let fundedOnly: Bool
 
@@ -592,11 +591,17 @@ actor Sponsor {
 
     func sponsor(client: String, draft: TransactionBody, pay: UInt64, fund: [String]?) throws -> SponsorResponse {
         let chainPath = draft.chainPath
-        // Decided and drawn with no await between, so the balance checked is
-        // the balance drawn.
-        let payer = try funds?.payer(for: draft, fund: fund, fundedOnly: fundedOnly)
         let fee = try currentFee(chainPath)
         let total = try charge(fee: fee, pay: pay, on: chainPath)
+        // Decided and committed with no await between, so the fund's room
+        // checked is the room held.
+        let backer: FundID? = if let funds {
+            try funds.backer(
+                for: draft, fund: fund, total: total, ledger: ledger, now: now(), fundedOnly: fundedOnly
+            )
+        } else {
+            nil
+        }
         let body = try sponsoredBody(
             draft: draft, sponsor: key.address, fee: fee, pay: pay, chainPath: chainPath
         )
@@ -606,9 +611,9 @@ actor Sponsor {
         let blockTime = Int64(clamping: specs[chainPath]?.targetBlockTime ?? 0)
         let hold = max(600_000, blockTime.multipliedReportingOverflow(by: 3).partialValue)
         try ledger.commit(
-            client: client, fee: total, on: chainPath, balance: balance, holdUntil: now() + hold, now: now()
+            client: client, fee: total, on: chainPath, balance: balance, holdUntil: now() + hold, now: now(),
+            fund: backer
         )
-        if let payer { try funds!.draw(payer, on: chainPath) }
         let header = try HeaderImpl(node: body)
         guard let signature = TransactionSigning.sign(bodyHeader: header, privateKeyHex: key.privateKey) else {
             throw HTTPError(.internalServerError, message: "signing failed")
@@ -621,17 +626,20 @@ actor Sponsor {
     }
 
     /// Credit a transfer to `payTo` once, as storage for an upload held with
-    /// --sell-storage, as a peer's serving standing, or to a fund.
+    /// --sell-storage, or as a peer's serving standing; or a transfer to the
+    /// sponsor's own account, to a fund.
     func pay(_ payment: CoinPayment) async throws -> PayResponse {
-        guard let payTo, payments != nil else { throw SponsorRefusal.noPayment }
+        guard let payTo = payment.recipient(payTo: payTo, sponsor: key.address), payments != nil else {
+            throw SponsorRefusal.noPayment
+        }
         let chainPath = payment.chainPath
         // Refused before reading the node, and again after, since an upload
         // can expire meanwhile. Returns the chain's rate.
         func check(at now: Int64) throws -> Int {
             if let fund = payment.fund {
-                guard let funds else { throw SponsorRefusal.noFundPrice }
+                guard funds != nil else { throw SponsorRefusal.noFunds }
                 _ = try FundLedger.normalize(fund)
-                return Int(clamping: try funds.price(on: chainPath))
+                return 0
             }
             if payment.peer != nil { return try serving.rate(on: chainPath) }
             guard let storage, let store = payment.store else { throw SponsorRefusal.unknownUpload }
@@ -647,8 +655,8 @@ actor Sponsor {
             let rate = try check(at: at)
             try payments!.release(payment.txCID, credit: true)
             if let fund = payment.fund {
-                let balance = try funds!.credit(try FundLedger.normalize(fund), coins: coins, on: chainPath)
-                return PayResponse(bytes: 0, balance: balance)
+                let deposit = try funds!.credit(FundID(try FundLedger.normalize(fund), on: chainPath), coins: coins)
+                return PayResponse(bytes: 0, deposit: deposit)
             }
             let value = UInt256(coins) * SponsorLedger.unit
             if let peer = payment.peer {
@@ -671,14 +679,17 @@ actor Sponsor {
     func terms() -> SponsorTerms {
         SponsorTerms(
             payTo: payTo, depth: coinDepth, storageRates: storage?.rates ?? [:], servingRates: serving.rates,
-            fundPrices: funds?.prices ?? [:]
+            fundTo: funds == nil ? nil : key.address
         )
     }
 
     func fund(chainPath: [String], prefixes: [String]) throws -> FundResponse {
-        guard let funds else { throw SponsorRefusal.noFundPrice }
-        let price = try funds.price(on: chainPath)
-        return FundResponse(balance: funds.balance(of: try FundLedger.normalize(prefixes), on: chainPath), price: price)
+        guard let funds else { throw SponsorRefusal.noFunds }
+        let id = FundID(try FundLedger.normalize(prefixes), on: chainPath)
+        let held = ledger.held(by: id, now: now())
+        return FundResponse(
+            deposit: funds.deposit(of: id), held: held > UInt256(UInt64.max) ? .max : UInt64(held.words[0])
+        )
     }
 
     /// What the sponsor spends for a fee and a payment, within --most-pay.
