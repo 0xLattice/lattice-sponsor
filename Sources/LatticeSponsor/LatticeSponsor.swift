@@ -196,39 +196,20 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
         let templates = HTTPMiningCoordinatorNodeClient(
             apiBaseURL: base, cookieFile: URL(fileURLWithPath: cookieFile)
         )
-        let blocks = BlockSubmitter(node: templates, sponsor: sponsor)
-        // The node pushes each template as it builds it: no new tip, no new
-        // template, however long that takes. Each connection asks for the
-        // chains the node hosts as it opens.
+        // A template on each change the node reports, never on a clock.
+        let address = signer.address
         let feed = Task {
-            var backoff = Backoff()
-            while !Task.isCancelled {
-                backoff.connecting()
-                var heard = false
-                do {
-                    for try await event in rpc.subscribe(try await templateRequest(rpc, signer.address)) {
-                        backoff.event()
-                        if case .template(let template, let clean) = event {
-                            await sponsor.install(template, clean: clean)
-                            // Heard again: blocks whose submit failed go now.
-                            if !heard { Task { await blocks.resubmit() } }
-                            heard = true
-                        }
-                    }
-                    print("the node ended the template subscription")
-                } catch SponsorRPC.SubscriptionEnd.hostedChainsChanged {
-                    // Ask again at once, for the chains it hosts now.
-                    print("the node's hosted chains changed: subscribing again")
-                    continue
-                } catch SponsorRPC.RPCFailure.noSubscription {
-                    print("the node has no template subscription (POST /mining/templates/subscribe); it must be upgraded")
-                } catch {
-                    print("template feed: \(error)")
-                }
-                // Unheard, the sponsor prices nothing; work handed out stays valid.
-                await sponsor.disconnect()
-                try? await Task.sleep(for: backoff.next())
-            }
+            await followTemplates(
+                events: { rpc.events() },
+                fetch: {
+                    // Hosted chains come and go without a restart.
+                    let chains = [DEFAULT_ROOT_DIRECTORY] + (try await rpc.hostedChains())
+                    return try await rpc.template(try MiningTemplateRequestBody.make(
+                        recipients: chains.map { "\($0)=\(address)" }, minimumWork: []
+                    ))
+                },
+                install: { await sponsor.install($0) }
+            )
         }
         defer { feed.cancel() }
 
@@ -248,7 +229,14 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
         router.post("shares") { request, context in
             let input = try await request.decode(as: ShareRequest.self, context: context)
             let (response, block, held) = await sponsor.share(assignment: input.assignment, nonce: input.nonce)
-            if let block { await blocks.submit(workID: block, nonce: input.nonce) }
+            if let block {
+                do {
+                    let submitted = try await templates.submit(workId: block, nonce: input.nonce)
+                    print("block \(block) nonce \(input.nonce): \(submitted.disposition)")
+                } catch {
+                    print("block \(block) nonce \(input.nonce) not sent: \(error)")
+                }
+            }
             // Pinning reads and writes every Volume: neither the block nor
             // the share's answer waits for it.
             if let store = held?.store { Task { await sponsor.pinIfPaid(store) } }
@@ -438,7 +426,7 @@ actor Sponsor {
     private let tokenKey: SymmetricKey
     /// Each chain's reward schedule, read once.
     private var specs: [[String]: ChainSpec] = [:]
-    /// Each chain's fee and the sponsor's balance there, read at every
+    /// Each chain's fee and the sponsor's balance there, read with every
     /// template so a request reads nothing from the node.
     private var fees: [[String]: UInt64] = [:]
     private var balances: [[String]: UInt64] = [:]
@@ -478,8 +466,8 @@ actor Sponsor {
 
     /// Take `template` as the newest work, priced on every chain whose block
     /// it carries pays this sponsor. A chain whose spec or fee cannot be read
-    /// is left unpriced. `clean`: work on earlier templates is gone.
-    func install(_ template: MiningTemplateResponse, clean: Bool) async {
+    /// is left unpriced.
+    func install(_ template: MiningTemplateResponse) async {
         var prices: [[String]: ChainPrice] = [:]
         for chain in template.chains ?? [] where chain.rewardRecipient == key.address {
             if specs[chain.chainPath] == nil {
@@ -503,33 +491,9 @@ actor Sponsor {
             prefixHex: ProofOfWork.proofOfWorkHashPrefixBytes(template.block)
                 .map { String(format: "%02x", $0) }.joined(),
             prices: prices,
-            submitTarget: template.searchTarget
-        ), clean: clean, now: now())
-    }
-
-    /// The node cannot be heard: price nothing until a template comes again.
-    func disconnect() {
-        ledger.disconnect()
-    }
-
-    /// The node answered the block `nonce` of `workID`; one refused as work
-    /// it no longer holds retires that work.
-    func answered(workID: String, nonce: UInt64, disposition: String) {
-        ledger.answered(workID: workID, nonce: nonce)
-        if disposition == "unknownWork" || disposition == "stale" { ledger.retire(workID: workID) }
-    }
-
-    /// Blocks whose submit failed, to hand the node again once it is heard.
-    private var unsent = UnsentBlocks()
-
-    func keep(workID: String, nonce: UInt64) {
-        if let dropped = unsent.keep(workID: workID, nonce: nonce) {
-            print("dropped block \(dropped.workID) nonce \(dropped.nonce): too many unsent")
-        }
-    }
-
-    func takeUnsent() -> [UnsentBlocks.Block] {
-        unsent.take()
+            submitTarget: template.searchTarget,
+            parent: template.block.parent?.rawCID ?? ""
+        ), now: now())
     }
 
     func work(client: String?, chainPath: [String], pay: UInt64, store: String?, peer: String?) throws -> WorkResponse {
@@ -741,8 +705,6 @@ actor Sponsor {
     }
 
     private func currentFee(_ chainPath: [String]) throws -> UInt64 {
-        // No template: the node cannot be heard, and the balance read with
-        // the last one may no longer show fees since mined.
         guard let latest = ledger.latest,
               latest.prices[chainPath] != nil, let fee = fees[chainPath] else {
             throw SponsorRefusal.unpriceable
@@ -835,54 +797,37 @@ struct SponsorRPC: Sendable {
         return hosted.chains
     }
 
-    /// One event on the template subscription.
-    enum FeedEvent: Sendable {
-        case template(MiningTemplateResponse, clean: Bool)
-        /// The node's keepalive: the connection lives, nothing changed.
-        case keepalive
-    }
-
-    /// Why the node ended a subscription (`event: end`).
-    enum SubscriptionEnd: Error, Equatable {
-        /// The chains it hosts changed: subscribe again for them.
-        case hostedChainsChanged
-        case other(String)
-    }
-
-    /// The node's templates as it builds them, over one connection, until it
-    /// ends. `RPCFailure.noSubscription`: the node has no subscription route.
-    func subscribe(_ body: Data) -> AsyncThrowingStream<FeedEvent, any Error> {
-        var request = authorized(base.appendingPathComponent("mining/templates/subscribe"))
+    /// A merged template, or nil while the node has none to give.
+    func template(_ body: Data) async throws -> MiningTemplateResponse? {
+        var request = authorized(base.appendingPathComponent("mining/templates"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.httpBody = body
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if status == 409 || status == 503 {
+            print("the node gave no template (\(status)): \(String(decoding: data, as: UTF8.self))")
+            return nil
+        }
+        guard status == 200 else { throw RPCFailure.status(status) }
+        return try JSONDecoder().decode(MiningTemplateResponse.self, from: data)
+    }
+
+    /// `GET /mining/events`: the node's digest on connect and whenever a
+    /// hosted chain's tip or pool, or the hosted set, changes, until the
+    /// connection ends.
+    func events() -> AsyncThrowingStream<String, any Error> {
+        var request = authorized(base.appendingPathComponent("mining/events"))
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         // The node writes a keepalive comment every 15 s: a connection
         // silent for longer is dead, whatever the chain does.
         request.timeoutInterval = 60
         return AsyncThrowingStream { continuation in
-            let events = EventStreamDelegate { event in
-                switch event.name {
-                case "template":
-                    do {
-                        let template = try JSONDecoder().decode(MiningTemplateResponse.self, from: event.data)
-                        // A node's first push to a connection is clean.
-                        continuation.yield(.template(template, clean: template.clean ?? true))
-                    } catch {
-                        continuation.finish(throwing: error)
-                    }
-                case "end":
-                    let reason = String(decoding: event.data, as: UTF8.self)
-                    continuation.finish(
-                        throwing: reason == "hostedChainsChanged" ? SubscriptionEnd.hostedChainsChanged : .other(reason)
-                    )
-                default:
-                    break
-                }
-            } keepalive: {
-                continuation.yield(.keepalive)
-            } finished: { continuation.finish(throwing: $0) }
-            let session = URLSession(configuration: .default, delegate: events, delegateQueue: nil)
+            let delegate = EventStreamDelegate(
+                event: { continuation.yield(String(decoding: $0.data, as: UTF8.self)) },
+                finished: { continuation.finish(throwing: $0) }
+            )
+            let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
             session.dataTask(with: request).resume()
             continuation.onTermination = { _ in session.invalidateAndCancel() }
         }
@@ -920,8 +865,6 @@ struct SponsorRPC: Sendable {
 
     enum RPCFailure: Error {
         case notFound
-        /// The node predates `POST /mining/templates/subscribe`.
-        case noSubscription
         case status(Int)
     }
 
@@ -950,51 +893,16 @@ struct SponsorRPC: Sendable {
     }
 }
 
-/// The template request for Nexus and every chain the node hosts, each
-/// paying `address`.
-private func templateRequest(_ rpc: SponsorRPC, _ address: String) async throws -> Data {
-    let chains = [DEFAULT_ROOT_DIRECTORY] + (try await rpc.hostedChains())
-    return try MiningTemplateRequestBody.make(recipients: chains.map { "\($0)=\(address)" }, minimumWork: [])
-}
-
-/// Hands the node blocks, marking each answered only once the node answers;
-/// one whose submit failed is kept and handed again once the node is heard.
-struct BlockSubmitter: Sendable {
-    let node: HTTPMiningCoordinatorNodeClient
-    let sponsor: Sponsor
-
-    func submit(workID: String, nonce: UInt64) async {
-        do {
-            let submitted = try await node.submit(workId: workID, nonce: nonce)
-            print("block \(workID) nonce \(nonce): \(submitted.disposition)")
-            await sponsor.answered(workID: workID, nonce: nonce, disposition: submitted.disposition)
-        } catch {
-            print("block \(workID) nonce \(nonce) not sent, kept to send again: \(error)")
-            await sponsor.keep(workID: workID, nonce: nonce)
-        }
-    }
-
-    func resubmit() async {
-        for block in await sponsor.takeUnsent() { await submit(workID: block.workID, nonce: block.nonce) }
-    }
-}
-
 /// A `text/event-stream` response's events, as URLSession delivers its
 /// bytes (corelibs Foundation streams through a data delegate on Linux too).
 private final class EventStreamDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private let event: @Sendable (ServerSentEvent) -> Void
-    private let keepalive: @Sendable () -> Void
     private let finished: @Sendable ((any Error)?) -> Void
     private let lock = NSLock()
     private var parser = ServerSentEventParser()
 
-    init(
-        event: @escaping @Sendable (ServerSentEvent) -> Void,
-        keepalive: @escaping @Sendable () -> Void,
-        finished: @escaping @Sendable ((any Error)?) -> Void
-    ) {
+    init(event: @escaping @Sendable (ServerSentEvent) -> Void, finished: @escaping @Sendable ((any Error)?) -> Void) {
         self.event = event
-        self.keepalive = keepalive
         self.finished = finished
     }
 
@@ -1006,7 +914,8 @@ private final class EventStreamDelegate: NSObject, URLSessionDataDelegate, @unch
     ) {
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard status == 200 else {
-            finished(status == 404 ? SponsorRPC.RPCFailure.noSubscription : SponsorRPC.RPCFailure.status(status))
+            // 404: the node has no `GET /mining/events`; it must be upgraded.
+            finished(SponsorRPC.RPCFailure.status(status))
             return completionHandler(.cancel)
         }
         completionHandler(.allow)
@@ -1014,12 +923,9 @@ private final class EventStreamDelegate: NSObject, URLSessionDataDelegate, @unch
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         lock.lock()
-        let comments = parser.comments
         let events = parser.feed(data)
-        let alive = parser.comments > comments
         lock.unlock()
         for next in events { event(next) }
-        if alive { keepalive() }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {

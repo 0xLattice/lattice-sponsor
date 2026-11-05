@@ -17,8 +17,6 @@ public struct ServerSentEventParser: Sendable {
     private var buffer = Data()
     private var event = ServerSentEvent()
     private var hasData = false
-    /// Comment lines read so far: the node's keepalives.
-    public private(set) var comments = 0
 
     public init() {}
 
@@ -36,10 +34,7 @@ public struct ServerSentEventParser: Sendable {
                 hasData = false
                 continue
             }
-            guard line.first != UInt8(ascii: ":") else {
-                comments += 1
-                continue
-            }
+            guard line.first != UInt8(ascii: ":") else { continue }
             let text = String(decoding: line, as: UTF8.self)
             let (field, value) = text.firstIndex(of: ":").map { colon in
                 let rest = text[text.index(after: colon)...]

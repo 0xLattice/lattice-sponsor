@@ -73,8 +73,9 @@ final class StorageCreditTests: XCTestCase {
             workID: "w1",
             prefixHex: "00",
             prices: [market: ChainPrice(target: (UInt256(1) << 204) - UInt256(1), height: 7, reward: 10)],
-            submitTarget: .zero
-        ), clean: false, now: 0)
+            submitTarget: .zero,
+            parent: "p"
+        ), now: 0)
         return ledger
     }
 

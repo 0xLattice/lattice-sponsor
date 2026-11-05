@@ -18,14 +18,11 @@ win.
 ## Running it
 
 It runs beside a node and reaches it only over the node's loopback RPC, as a
-miner does. The node pushes each new template as it builds it
-(`POST /mining/templates/subscribe`), and work never expires on a clock: a
-range stays valid until the node says the tip moved, since proof-of-work
-arrivals are memoryless. While the sponsor cannot hear its node it prices
-nothing (`unpriceable`); a block whose submit failed is kept and handed to the
-node again once it is heard. It needs a node with that route (lattice-node
-#57 or later): against an older one it only logs the missing route and keeps
-retrying.
+miner does. It asks for a template whenever the node reports a change
+(`GET /mining/events`: a hosted chain's tip or pool, or the hosted set), never
+on a clock: proof-of-work arrivals are memoryless, so work stays valid until a
+template on a new tip replaces it. It needs a node with that route; against an
+older one it logs the failure and keeps retrying.
 
 ```sh
 lattice-sponsor \

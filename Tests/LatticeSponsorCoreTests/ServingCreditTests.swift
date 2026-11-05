@@ -46,8 +46,8 @@ final class ServingCreditTests: XCTestCase {
         let price = ChainPrice(target: (UInt256(1) << 204) - UInt256(1), height: 7, reward: 10)
         var ledger = SponsorLedger(shareTarget: (UInt256(1) << 208) - UInt256(1), rangeSize: 100)
         ledger.install(SponsorTemplate(
-            workID: "w1", prefixHex: "00", prices: [market: price], submitTarget: .zero
-        ), clean: false, now: 0)
+            workID: "w1", prefixHex: "00", prices: [market: price], submitTarget: .zero, parent: "p"
+        ), now: 0)
         let assignment = try ledger.assign(client: "a", on: market, peer: peer)
         let value = try ledger.credit(assignment: assignment.id, nonce: 1, hash: UInt256(1), now: 1)
         XCTAssertEqual(ledger.credit(of: "a", on: market), .zero, "serving work is not fee credit")
