@@ -203,16 +203,34 @@ public struct SponsorLedger: Sendable {
         self.creditLifetime = creditLifetime
     }
 
-    /// The newest template, the one new work is handed out from.
+    /// The newest template, the one new work is handed out from; nil while
+    /// the sponsor cannot tell what the node holds.
     public private(set) var latest: SponsorTemplate?
 
+    /// The node's work is unknown (a fetch failed, or its events ended):
+    /// no new work or price until a template is installed. Work handed out
+    /// keeps its credit, and its blocks still go to the node, which judges.
+    public mutating func blind() {
+        latest = nil
+    }
+
+    /// The node no longer holds `workID` (it refused a block on it as
+    /// unknown): retire it and its work. Not the newest: a refusal on it
+    /// means the tip moved, and the node's event brings its replacement.
+    public mutating func retire(workID: String) {
+        guard workID != latest?.workID else { return }
+        retire([workID])
+    }
+
     /// Take `template` as the newest work. On a new tip (another parent),
-    /// work on every earlier template is gone; on the same tip only the pool
-    /// or a hosted chain moved, and earlier work stays valid. Time never
-    /// retires work: proof-of-work arrivals are memoryless. This runs as
-    /// templates arrive, so requests never pay for the sweep.
-    public mutating func install(_ template: SponsorTemplate, now: Int64) {
-        if let latest, latest.parent != template.parent {
+    /// or `fresh` (the first since connecting: the node may have restarted
+    /// and lost what it handed out), work on every earlier template is gone;
+    /// otherwise only the pool or a hosted chain moved, and earlier work
+    /// stays valid. Time never retires work: proof-of-work arrivals are
+    /// memoryless. This runs as templates arrive, so requests never pay for
+    /// the sweep.
+    public mutating func install(_ template: SponsorTemplate, fresh: Bool = false, now: Int64) {
+        if fresh || order.last.flatMap({ templates[$0] })?.parent != template.parent {
             retire(order.filter { $0 != template.workID })
         }
         if templates[template.workID] == nil {

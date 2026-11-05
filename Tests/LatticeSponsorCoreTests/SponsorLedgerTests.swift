@@ -330,6 +330,49 @@ final class SponsorLedgerTests: XCTestCase {
         XCTAssertEqual(ledger.credit(of: "a", on: nexus), nexusShare)
     }
 
+    /// The first template since connecting retires earlier work even on the
+    /// same tip: the node may have restarted and lost it.
+    func testAFreshTemplateRetiresEarlierWork() throws {
+        var ledger = ledger()
+        let a = try ledger.assign(client: "a", on: nexus)
+        ledger.install(template(workID: "w2"), fresh: true, now: 1)
+        XCTAssertThrowsError(try ledger.credit(assignment: a.id, nonce: 1, hash: UInt256(1), now: 2)) {
+            XCTAssertEqual($0 as? SponsorRefusal, .unknownAssignment)
+        }
+    }
+
+    /// Blind (a fetch failed, or the node's events ended), the sponsor hands
+    /// out no work and prices nothing; work handed out keeps its credit and
+    /// its blocks, and the next template ends it.
+    func testBlindHandsOutNothingButKeepsWorkHandedOut() throws {
+        var ledger = ledger()
+        let a = try ledger.assign(client: "a", on: nexus)
+        ledger.blind()
+        XCTAssertThrowsError(try ledger.assign(client: "b", on: nexus)) {
+            XCTAssertEqual($0 as? SponsorRefusal, .unpriceable)
+        }
+        XCTAssertNil(ledger.sharesFor(fee: 1, on: nexus))
+        XCTAssertEqual(try ledger.credit(assignment: a.id, nonce: 1, hash: UInt256(1), now: 1), nexusShare)
+        XCTAssertEqual(ledger.block(assignment: a.id, nonce: 2, hash: target(203)), "w1")
+        ledger.install(template(workID: "w2"), now: 2)
+        XCTAssertEqual(try ledger.assign(client: "b", on: nexus).workID, "w2")
+        XCTAssertNoThrow(try ledger.credit(assignment: a.id, nonce: 3, hash: UInt256(1), now: 3), "same tip, still valid")
+    }
+
+    /// A block refused as work the node no longer holds retires that work;
+    /// the newest waits for the node's event to replace it.
+    func testWorkTheNodeNoLongerHoldsIsRetired() throws {
+        var ledger = ledger()
+        let a = try ledger.assign(client: "a", on: nexus)
+        ledger.install(template(workID: "w2"), now: 1)
+        ledger.retire(workID: "w1")
+        XCTAssertThrowsError(try ledger.credit(assignment: a.id, nonce: 1, hash: UInt256(1), now: 2)) {
+            XCTAssertEqual($0 as? SponsorRefusal, .unknownAssignment)
+        }
+        ledger.retire(workID: "w2")
+        XCTAssertEqual(try ledger.assign(client: "b", on: nexus).workID, "w2")
+    }
+
     /// On one tip, the templates held are bounded: the oldest go first.
     func testTemplatesPastTheCapDropOldestFirst() throws {
         var ledger = SponsorLedger(shareTarget: target(208), rangeSize: 100, maxTemplates: 2)

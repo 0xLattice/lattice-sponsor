@@ -208,7 +208,8 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
                         recipients: chains.map { "\($0)=\(address)" }, minimumWork: []
                     ))
                 },
-                install: { await sponsor.install($0) }
+                install: { await sponsor.install($0, fresh: $1) },
+                blind: { await sponsor.blind() }
             )
         }
         defer { feed.cancel() }
@@ -233,6 +234,9 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
                 do {
                     let submitted = try await templates.submit(workId: block, nonce: input.nonce)
                     print("block \(block) nonce \(input.nonce): \(submitted.disposition)")
+                    if submitted.disposition == "unknownWork" || submitted.disposition == "stale" {
+                        await sponsor.retire(workID: block)
+                    }
                 } catch {
                     print("block \(block) nonce \(input.nonce) not sent: \(error)")
                 }
@@ -466,8 +470,8 @@ actor Sponsor {
 
     /// Take `template` as the newest work, priced on every chain whose block
     /// it carries pays this sponsor. A chain whose spec or fee cannot be read
-    /// is left unpriced.
-    func install(_ template: MiningTemplateResponse) async {
+    /// is left unpriced. `fresh`: the first since connecting to the node.
+    func install(_ template: MiningTemplateResponse, fresh: Bool) async {
         var prices: [[String]: ChainPrice] = [:]
         for chain in template.chains ?? [] where chain.rewardRecipient == key.address {
             if specs[chain.chainPath] == nil {
@@ -493,7 +497,17 @@ actor Sponsor {
             prices: prices,
             submitTarget: template.searchTarget,
             parent: template.block.parent?.rawCID ?? ""
-        ), now: now())
+        ), fresh: fresh, now: now())
+    }
+
+    /// The node's work is unknown: no new work or price until a template.
+    func blind() {
+        ledger.blind()
+    }
+
+    /// The node refused a block on `workID` as work it no longer holds.
+    func retire(workID: String) {
+        ledger.retire(workID: workID)
     }
 
     func work(client: String?, chainPath: [String], pay: UInt64, store: String?, peer: String?) throws -> WorkResponse {
@@ -816,15 +830,17 @@ struct SponsorRPC: Sendable {
     /// `GET /mining/events`: the node's digest on connect and whenever a
     /// hosted chain's tip or pool, or the hosted set, changes, until the
     /// connection ends.
-    func events() -> AsyncThrowingStream<String, any Error> {
+    func events() -> AsyncThrowingStream<Void, any Error> {
         var request = authorized(base.appendingPathComponent("mining/events"))
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         // The node writes a keepalive comment every 15 s: a connection
         // silent for longer is dead, whatever the chain does.
         request.timeoutInterval = 60
-        return AsyncThrowingStream { continuation in
+        // Only the newest change matters: a backlog would hold a new tip
+        // behind changes already superseded.
+        return changes { continuation in
             let delegate = EventStreamDelegate(
-                event: { continuation.yield(String(decoding: $0.data, as: UTF8.self)) },
+                event: { continuation.yield() },
                 finished: { continuation.finish(throwing: $0) }
             )
             let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
@@ -896,12 +912,12 @@ struct SponsorRPC: Sendable {
 /// A `text/event-stream` response's events, as URLSession delivers its
 /// bytes (corelibs Foundation streams through a data delegate on Linux too).
 private final class EventStreamDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
-    private let event: @Sendable (ServerSentEvent) -> Void
+    private let event: @Sendable () -> Void
     private let finished: @Sendable ((any Error)?) -> Void
     private let lock = NSLock()
-    private var parser = ServerSentEventParser()
+    private var counter = ServerSentEventCounter()
 
-    init(event: @escaping @Sendable (ServerSentEvent) -> Void, finished: @escaping @Sendable ((any Error)?) -> Void) {
+    init(event: @escaping @Sendable () -> Void, finished: @escaping @Sendable ((any Error)?) -> Void) {
         self.event = event
         self.finished = finished
     }
@@ -923,9 +939,9 @@ private final class EventStreamDelegate: NSObject, URLSessionDataDelegate, @unch
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         lock.lock()
-        let events = parser.feed(data)
+        let events = counter.feed(data)
         lock.unlock()
-        for next in events { event(next) }
+        if events > 0 { event() }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
