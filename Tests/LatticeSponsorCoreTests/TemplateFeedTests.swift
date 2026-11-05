@@ -44,6 +44,34 @@ final class TemplateFeedTests: XCTestCase {
         XCTAssertEqual(log.waits, [.milliseconds(250), .milliseconds(250)], "an install resets the wait")
     }
 
+    /// A fetch that brings no template drops the connection, and the next
+    /// connection's first event fetches again: a change is never left
+    /// unfetched waiting for another.
+    func testAFailedFetchReconnectsAndFetchesAgain() async {
+        let log = Log()
+        await followTemplates(
+            events: {
+                _ = log.connect()
+                return AsyncThrowingStream { continuation in
+                    continuation.yield("d")
+                    continuation.yield("d again")
+                    continuation.finish()
+                }
+            },
+            fetch: { () -> Int? in
+                let fetch = log.fetch()
+                if fetch == 1 { return nil }
+                if fetch == 2 { throw Dropped() }
+                return fetch
+            },
+            install: { log.install($0) },
+            log: { _ in },
+            sleep: { if log.wait($0) == 3 { throw Stop() } }
+        )
+        XCTAssertEqual(log.installed, [3, 4], "the third connection installs its event and the next")
+        XCTAssertEqual(log.waits, [.milliseconds(250), .milliseconds(500), .milliseconds(250)])
+    }
+
     /// With nothing installed, the waits between connections double to 5 s.
     func testWaitsDoubleWhileNothingIsInstalled() async {
         let log = Log()

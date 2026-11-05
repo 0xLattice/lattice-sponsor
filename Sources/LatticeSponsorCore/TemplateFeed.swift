@@ -5,9 +5,11 @@
 
 /// For each change the node reports, fetch a template and install it, one
 /// at a time: the node keeps only the newest event per client, so a burst
-/// comes as one. When the events end or fail, connect again after a wait of
-/// 250 ms, doubling to 5 s, back to 250 ms once a template is installed.
-/// Returns when `sleep` throws (cancellation).
+/// comes as one. When the events end or fail, or a fetch brings no template
+/// (the change may have been a new tip, and no later event need come),
+/// connect again after a wait of 250 ms, doubling to 5 s, back to 250 ms
+/// once a template is installed: a new connection's first event fetches
+/// again. Returns when `sleep` throws (cancellation).
 public func followTemplates<Template: Sendable>(
     events: @Sendable () async throws -> AsyncThrowingStream<String, any Error>,
     fetch: @Sendable () async throws -> Template?,
@@ -20,19 +22,20 @@ public func followTemplates<Template: Sendable>(
     while true {
         do {
             for try await _ in try await events() {
-                do {
-                    guard let template = try await fetch() else { continue }
-                    await install(template)
-                    wait = first
-                } catch {
-                    log("template fetch failed: \(error)")
-                }
+                guard let template = try await fetch() else { throw FeedError.noTemplate }
+                await install(template)
+                wait = first
             }
             log("the node's events ended")
         } catch {
-            log("the node's events failed: \(error)")
+            log("template feed: \(error)")
         }
         do { try await sleep(wait) } catch { return }
         wait = min(wait * 2, .seconds(5))
     }
+}
+
+enum FeedError: Error {
+    /// The node had no template to give (busy, or not ready).
+    case noTemplate
 }
