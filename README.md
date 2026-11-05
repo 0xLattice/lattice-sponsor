@@ -22,8 +22,10 @@ miner does. The node pushes each new template as it builds it
 (`POST /mining/templates/subscribe`), and work never expires on a clock: a
 range stays valid until the node says the tip moved, since proof-of-work
 arrivals are memoryless. While the sponsor cannot hear its node it prices
-nothing (`unpriceable`). Against a node without the subscription route, it
-asks for a template every few seconds instead.
+nothing (`unpriceable`); a block whose submit failed is kept and handed to the
+node again once it is heard. It needs a node with that route (lattice-node
+#57 or later): against an older one it only logs the missing route and keeps
+retrying.
 
 ```sh
 lattice-sponsor \

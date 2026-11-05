@@ -148,7 +148,10 @@ public struct SponsorLedger: Sendable {
     public let shareTarget: UInt256
     public let rangeSize: UInt64
     public let maxAssignments: Int
-    /// The most templates held between two clean ones, oldest dropped first.
+    /// The most templates held between two clean ones, oldest dropped first,
+    /// and the most retired ones still submitted. Well under the node's own
+    /// bound (512, shared by every requester), so the sponsor never holds
+    /// work the node has dropped.
     public let maxTemplates: Int
     /// How long a client's credit outlives its last share.
     public let creditLifetime: Int64
@@ -156,12 +159,16 @@ public struct SponsorLedger: Sendable {
     private var templates: [String: SponsorTemplate] = [:]
     /// `templates`' work IDs, oldest first.
     private var order: [String] = []
-    /// The templates last retired and their assignments: no longer credited,
-    /// but a share on them that clears the submit target still goes to the
-    /// node, which judges it (a reconnect's clean push may retire work the
-    /// node still holds).
+    /// Templates retired lately and their assignments, oldest first and at
+    /// most `maxTemplates`: no longer credited, but a share on them that
+    /// clears the submit target still goes to the node, which judges it (a
+    /// reconnect's clean push may retire work the node still holds).
     private var retiredTemplates: [String: SponsorTemplate] = [:]
+    private var retiredOrder: [String] = []
     private var retiredAssignments: [String: ShareAssignment] = [:]
+    /// Blocks handed to the node and not yet answered: never handed twice
+    /// at once, and marked `submitted` only once the node answers.
+    private var submitting: Set<ShareKey> = []
     private var nextStart: [String: UInt64] = [:]
     private var assignments: [String: ShareAssignment] = [:]
     private var shares: Set<ShareKey> = []
@@ -193,7 +200,7 @@ public struct SponsorLedger: Sendable {
         shareTarget: UInt256,
         rangeSize: UInt64 = 1 << 32,
         maxAssignments: Int = 100_000,
-        maxTemplates: Int = 1_024,
+        maxTemplates: Int = 64,
         creditLifetime: Int64 = 3_600_000
     ) {
         precondition(shareTarget > .zero && rangeSize > 0 && maxAssignments > 0 && maxTemplates > 0)
@@ -216,6 +223,14 @@ public struct SponsorLedger: Sendable {
     /// runs as templates arrive, so requests never pay for the sweep.
     public mutating func install(_ template: SponsorTemplate, clean: Bool, now: Int64) {
         if clean { retire(order.filter { $0 != template.workID }) }
+        if retiredTemplates.removeValue(forKey: template.workID) != nil {
+            // Pushed again: the node holds it, and so its work, once more.
+            retiredOrder.removeAll { $0 == template.workID }
+            for (id, assignment) in retiredAssignments where assignment.workID == template.workID {
+                assignments[id] = assignment
+                retiredAssignments.removeValue(forKey: id)
+            }
+        }
         if templates[template.workID] == nil {
             templates[template.workID] = template
             order.append(template.workID)
@@ -316,16 +331,32 @@ public struct SponsorLedger: Sendable {
     }
 
     /// The template to submit `nonce` to as a block, when its `hash` clears
-    /// the template's submit target, once per nonce. Decided apart from
-    /// credit: a share the client is not credited for (its chain sold out or
-    /// moved on) can still be the sponsor's block on another chain, and the
-    /// node judges it.
+    /// the template's submit target, once per nonce until the node answers
+    /// (`answered`). Decided apart from credit: a share the client is not
+    /// credited for (its chain sold out or moved on) can still be the
+    /// sponsor's block on another chain, and the node judges it.
     public mutating func block(assignment id: String, nonce: UInt64, hash: UInt256) -> String? {
         guard let assignment = assignments[id] ?? retiredAssignments[id],
               let template = templates[assignment.workID] ?? retiredTemplates[assignment.workID],
-              hash <= template.submitTarget,
-              submitted.insert(ShareKey(workID: template.workID, nonce: nonce)).inserted else { return nil }
+              hash <= template.submitTarget else { return nil }
+        let key = ShareKey(workID: template.workID, nonce: nonce)
+        guard !submitted.contains(key), submitting.insert(key).inserted else { return nil }
         return template.workID
+    }
+
+    /// The node answered the block `nonce` of `workID`: it is never handed
+    /// again. A block whose submit failed stays unanswered, and the caller
+    /// hands it again.
+    public mutating func answered(workID: String, nonce: UInt64) {
+        let key = ShareKey(workID: workID, nonce: nonce)
+        submitting.remove(key)
+        submitted.insert(key)
+    }
+
+    /// The node no longer holds `workID` (it refused a block on it as
+    /// unknown): retire it and its work.
+    public mutating func retire(workID: String) {
+        retire([workID])
     }
 
     /// The highest height of `chainPath`'s block in any template held. An
@@ -395,22 +426,36 @@ public struct SponsorLedger: Sendable {
         }
     }
 
-    /// Retire `workIDs`' templates and the work handed out on them, and
-    /// forget those retired before.
+    /// Retire `workIDs`' held templates and the work handed out on them;
+    /// past `maxTemplates` retired, the oldest retired are forgotten.
     private mutating func retire(_ workIDs: [String]) {
-        guard !workIDs.isEmpty else { return }
-        let gone = Set(workIDs)
-        let forgotten = Set(retiredTemplates.keys)
-        retiredTemplates = templates.filter { gone.contains($0.key) }
-        retiredAssignments = assignments.filter { gone.contains($0.value.workID) }
-        for workID in gone {
-            templates.removeValue(forKey: workID)
-            nextStart.removeValue(forKey: workID)
+        let gone = Set(workIDs.filter { templates[$0] != nil })
+        guard !gone.isEmpty else { return }
+        for workID in order where gone.contains(workID) {
+            retiredTemplates[workID] = templates[workID]
+            retiredOrder.append(workID)
         }
+        for (id, assignment) in assignments where gone.contains(assignment.workID) {
+            retiredAssignments[id] = assignment
+        }
+        // Its ranges and shares are kept while it is retired: pushed again,
+        // its work is valid again and must not be handed out or paid twice.
+        for workID in gone { templates.removeValue(forKey: workID) }
         order.removeAll { gone.contains($0) }
         assignments = assignments.filter { !gone.contains($0.value.workID) }
-        shares = shares.filter { !gone.contains($0.workID) }
-        submitted = submitted.filter { !forgotten.contains($0.workID) || gone.contains($0.workID) }
+        // No new work on a template the node no longer holds.
+        if let latest, gone.contains(latest.workID) { self.latest = nil }
+        guard retiredOrder.count > maxTemplates else { return }
+        let forgotten = Set(retiredOrder.prefix(retiredOrder.count - maxTemplates))
+        retiredOrder.removeFirst(retiredOrder.count - maxTemplates)
+        for workID in forgotten {
+            retiredTemplates.removeValue(forKey: workID)
+            nextStart.removeValue(forKey: workID)
+        }
+        retiredAssignments = retiredAssignments.filter { !forgotten.contains($0.value.workID) }
+        shares = shares.filter { !forgotten.contains($0.workID) }
+        submitted = submitted.filter { !forgotten.contains($0.workID) }
+        submitting = submitting.filter { !forgotten.contains($0.workID) }
     }
 
     private mutating func prune(now: Int64) {

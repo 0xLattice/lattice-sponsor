@@ -334,8 +334,81 @@ final class SponsorLedgerTests: XCTestCase {
         XCTAssertEqual(ledger.credit(of: "a", on: nexus), nexusShare, "credit already earned stays")
         XCTAssertEqual(try ledger.assign(client: "a", on: nexus).workID, "w2")
         ledger.install(template(workID: "w3"), clean: true, now: 3)
-        XCTAssertNil(ledger.block(assignment: a.id, nonce: 3, hash: target(203)), "two clean pushes on, it is forgotten")
+        XCTAssertEqual(
+            ledger.block(assignment: a.id, nonce: 3, hash: target(203)), "w1",
+            "a second clean push keeps earlier retired work too"
+        )
     }
+
+    /// Retired work is forgotten only past `maxTemplates` retired, oldest
+    /// first, however many clean pushes come.
+    func testRetiredWorkIsForgottenOldestFirstPastTheBound() throws {
+        var ledger = SponsorLedger(shareTarget: target(208), rangeSize: 100, maxTemplates: 2)
+        ledger.install(template(), clean: false, now: 0)
+        let a = try ledger.assign(client: "a", on: nexus)
+        ledger.install(template(workID: "w2"), clean: true, now: 1)
+        let b = try ledger.assign(client: "b", on: nexus)
+        ledger.install(template(workID: "w3"), clean: true, now: 2)
+        XCTAssertEqual(ledger.block(assignment: a.id, nonce: 1, hash: target(203)), "w1")
+        XCTAssertEqual(ledger.block(assignment: b.id, nonce: 1, hash: target(203)), "w2")
+        ledger.install(template(workID: "w4"), clean: true, now: 3)
+        XCTAssertNil(ledger.block(assignment: a.id, nonce: 2, hash: target(203)), "w1 is the oldest retired")
+        XCTAssertEqual(ledger.block(assignment: b.id, nonce: 2, hash: target(203)), "w2")
+    }
+
+    /// The node refused a block on work it no longer holds: that work
+    /// earns nothing more and no new work goes on it, though a block on it
+    /// is still the node's to judge.
+    func testWorkTheNodeNoLongerHoldsIsRetired() throws {
+        var ledger = ledger()
+        let a = try ledger.assign(client: "a", on: nexus)
+        ledger.retire(workID: "w1")
+        XCTAssertThrowsError(try ledger.credit(assignment: a.id, nonce: 1, hash: UInt256(1), now: 1)) {
+            XCTAssertEqual($0 as? SponsorRefusal, .unknownAssignment)
+        }
+        XCTAssertThrowsError(try ledger.assign(client: "b", on: nexus)) {
+            XCTAssertEqual($0 as? SponsorRefusal, .unpriceable, "the newest template is gone until the next")
+        }
+        ledger.install(template(workID: "w2"), clean: false, now: 2)
+        XCTAssertEqual(try ledger.assign(client: "b", on: nexus).workID, "w2")
+    }
+
+    /// Work pushed again after it was retired is the node's again: its ranges
+    /// are valid, its shares are not paid twice, and new ranges do not
+    /// overlap them.
+    func testRetiredWorkPushedAgainIsValidAgain() throws {
+        var ledger = ledger()
+        let a = try ledger.assign(client: "a", on: nexus)
+        _ = try ledger.credit(assignment: a.id, nonce: 0, hash: UInt256(1), now: 1)
+        ledger.install(template(workID: "w2"), clean: true, now: 2)
+        ledger.install(template(), clean: true, now: 3)
+        XCTAssertEqual(try ledger.credit(assignment: a.id, nonce: 1, hash: UInt256(1), now: 4), nexusShare)
+        XCTAssertThrowsError(try ledger.credit(assignment: a.id, nonce: 0, hash: UInt256(1), now: 4)) {
+            XCTAssertEqual($0 as? SponsorRefusal, .duplicateShare)
+        }
+        XCTAssertEqual(try ledger.assign(client: "b", on: nexus).startNonce, 100)
+    }
+
+    /// A block is handed to the node once while its submit is out, and once
+    /// answered, never again; one whose submit failed is not answered, so it
+    /// is not marked sent (the sponsor keeps it to hand again).
+    func testABlockIsMarkedSentOnlyOnceTheNodeAnswers() throws {
+        var ledger = ledger()
+        let a = try ledger.assign(client: "a", on: nexus)
+        XCTAssertEqual(ledger.block(assignment: a.id, nonce: 1, hash: target(203)), "w1")
+        XCTAssertNil(ledger.block(assignment: a.id, nonce: 1, hash: target(203)), "its submit is out")
+        ledger.answered(workID: "w1", nonce: 1)
+        XCTAssertNil(ledger.block(assignment: a.id, nonce: 1, hash: target(203)), "answered")
+
+        var unsent = UnsentBlocks(capacity: 2)
+        XCTAssertEqual(ledger.block(assignment: a.id, nonce: 2, hash: target(203)), "w1")
+        unsent.keep(workID: "w1", nonce: 2)  // the node could not be reached
+        XCTAssertEqual(unsent.take(), [UnsentBlocks.Block(workID: "w1", nonce: 2)], "handed again once heard")
+        XCTAssertEqual(unsent.count, 0)
+        ledger.answered(workID: "w1", nonce: 2)
+        XCTAssertNil(ledger.block(assignment: a.id, nonce: 2, hash: target(203)))
+    }
+
 
     /// A reconnect's first push is clean; when it repeats the work in hand,
     /// that work is still the node's and stays valid.

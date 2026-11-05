@@ -18,6 +18,14 @@ final class ServerSentEventTests: XCTestCase {
         }
     }
 
+    func testKeepalivesAreCounted() {
+        var parser = ServerSentEventParser()
+        XCTAssertEqual(parser.feed(Data(": keepalive\n\n: kee".utf8)), [])
+        XCTAssertEqual(parser.comments, 1)
+        _ = parser.feed(Data("palive\n\n".utf8))
+        XCTAssertEqual(parser.comments, 2)
+    }
+
     func testDataLinesJoinWithNewlines() {
         var parser = ServerSentEventParser()
         XCTAssertEqual(parser.feed(Data("data: a\ndata:b\n\n".utf8)), [ServerSentEvent(data: Data("a\nb".utf8))])
