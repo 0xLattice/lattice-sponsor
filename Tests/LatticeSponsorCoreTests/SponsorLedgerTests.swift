@@ -357,20 +357,20 @@ final class SponsorLedgerTests: XCTestCase {
     }
 
     /// The node refused a block on work it no longer holds: that work
-    /// earns nothing more and no new work goes on it, though a block on it
-    /// is still the node's to judge.
+    /// earns nothing more, though a block on it is still the node's to judge.
+    /// The newest template stays until the node's next push replaces it, so
+    /// the sponsor keeps pricing in between.
     func testWorkTheNodeNoLongerHoldsIsRetired() throws {
         var ledger = ledger()
         let a = try ledger.assign(client: "a", on: nexus)
+        ledger.install(template(workID: "w2"), clean: false, now: 1)
         ledger.retire(workID: "w1")
-        XCTAssertThrowsError(try ledger.credit(assignment: a.id, nonce: 1, hash: UInt256(1), now: 1)) {
+        XCTAssertThrowsError(try ledger.credit(assignment: a.id, nonce: 1, hash: UInt256(1), now: 2)) {
             XCTAssertEqual($0 as? SponsorRefusal, .unknownAssignment)
         }
-        XCTAssertThrowsError(try ledger.assign(client: "b", on: nexus)) {
-            XCTAssertEqual($0 as? SponsorRefusal, .unpriceable, "the newest template is gone until the next")
-        }
-        ledger.install(template(workID: "w2"), clean: false, now: 2)
-        XCTAssertEqual(try ledger.assign(client: "b", on: nexus).workID, "w2")
+        XCTAssertEqual(ledger.block(assignment: a.id, nonce: 2, hash: target(203)), "w1")
+        ledger.retire(workID: "w2")
+        XCTAssertEqual(try ledger.assign(client: "b", on: nexus).workID, "w2", "the newest waits for the push")
     }
 
     /// Work pushed again after it was retired is the node's again: its ranges

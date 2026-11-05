@@ -354,8 +354,11 @@ public struct SponsorLedger: Sendable {
     }
 
     /// The node no longer holds `workID` (it refused a block on it as
-    /// unknown): retire it and its work.
+    /// unknown): retire it and its work. Not the newest template: a refusal
+    /// on it means the tip moved, and the node's clean push replacing it is
+    /// on its way; pricing on it until then is what the push corrects.
     public mutating func retire(workID: String) {
+        guard workID != latest?.workID else { return }
         retire([workID])
     }
 
@@ -443,8 +446,6 @@ public struct SponsorLedger: Sendable {
         for workID in gone { templates.removeValue(forKey: workID) }
         order.removeAll { gone.contains($0) }
         assignments = assignments.filter { !gone.contains($0.value.workID) }
-        // No new work on a template the node no longer holds.
-        if let latest, gone.contains(latest.workID) { self.latest = nil }
         guard retiredOrder.count > maxTemplates else { return }
         let forgotten = Set(retiredOrder.prefix(retiredOrder.count - maxTemplates))
         retiredOrder.removeFirst(retiredOrder.count - maxTemplates)
