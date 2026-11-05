@@ -1,5 +1,5 @@
 {
-  "originHash": "c5fd845cedd714fc6d7c2f0a5ad5c6561b3098ce79b1dcefa49311b57bea425a",
+  "originHash": "4219905bd4565225e53b65ba528f4976cc7eedac03e8a42c26193ff8aeef880b",
   "pins": [
     {
       "identity": "arraytrie",
@@ -78,7 +78,7 @@
       "kind": "remoteSourceControl",
       "location": "https://github.com/0xLattice/lattice-node.git",
       "state": {
-        "revision": "877ce7ae6fe0d3fcfcf6152b9151cf5e708203ad"
+        "revision": "29f088e7f782526db7f5485f6a6129923e8c916b"
       }
     },
     {

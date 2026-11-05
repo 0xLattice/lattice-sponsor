@@ -14,7 +14,7 @@ let package = Package(
         // pin on purpose, after the tests pass against it.
         .package(
             url: "https://github.com/0xLattice/lattice-node.git",
-            revision: "877ce7ae6fe0d3fcfcf6152b9151cf5e708203ad"
+            revision: "29f088e7f782526db7f5485f6a6129923e8c916b"
         ),
         // The node's own pins, so both build the same consensus code.
         .package(
