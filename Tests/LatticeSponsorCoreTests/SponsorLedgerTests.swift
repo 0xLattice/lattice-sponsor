@@ -19,8 +19,7 @@ private let market = ["Nexus", "Market"]
 private func template(
     workID: String = "w1",
     marketReward: UInt64? = 10,
-    marketHeight: UInt64 = 7,
-    expiresAt: Int64 = 30_000
+    marketHeight: UInt64 = 7
 ) -> SponsorTemplate {
     var prices = [nexus: ChainPrice(target: target(200), height: 3, reward: 1_000)]
     if let marketReward {
@@ -30,8 +29,7 @@ private func template(
         workID: workID,
         prefixHex: "00",
         prices: prices,
-        submitTarget: target(204),
-        expiresAt: expiresAt
+        submitTarget: target(204)
     )
 }
 
@@ -62,7 +60,7 @@ final class SponsorLedgerTests: XCTestCase {
     /// its 10: 10/16 units).
     private func ledger() -> SponsorLedger {
         var ledger = SponsorLedger(shareTarget: target(208), rangeSize: 100)
-        ledger.install(template(), now: 0)
+        ledger.install(template(), clean: false, now: 0)
         return ledger
     }
 
@@ -71,8 +69,8 @@ final class SponsorLedgerTests: XCTestCase {
 
     func testSharesCreditOnlyInsideTheirOwnRangeOnce() throws {
         var ledger = ledger()
-        let a = try ledger.assign(client: "a", on: nexus, now: 0)
-        let b = try ledger.assign(client: "b", on: nexus, now: 0)
+        let a = try ledger.assign(client: "a", on: nexus)
+        let b = try ledger.assign(client: "b", on: nexus)
         XCTAssertEqual(a.startNonce, 0)
         XCTAssertEqual(b.startNonce, 100, "ranges are disjoint")
 
@@ -88,31 +86,27 @@ final class SponsorLedgerTests: XCTestCase {
         XCTAssertThrowsError(try ledger.credit(assignment: a.id, nonce: 6, hash: ledger.shareTarget + UInt256(1), now: 1)) {
             XCTAssertEqual($0 as? SponsorRefusal, .missesShareTarget)
         }
-        XCTAssertThrowsError(try ledger.credit(assignment: a.id, nonce: 7, hash: easy, now: 30_000)) {
-            XCTAssertEqual($0 as? SponsorRefusal, .expired)
-        }
         XCTAssertEqual(ledger.credit(of: "b", on: nexus), .zero)
     }
 
     func testAShareClearingTheSubmitTargetIsABlock() throws {
         var ledger = ledger()
-        let a = try ledger.assign(client: "a", on: nexus, now: 0)
-        XCTAssertNil(ledger.block(assignment: a.id, nonce: 1, hash: target(205), now: 1))
-        XCTAssertEqual(ledger.block(assignment: a.id, nonce: 2, hash: target(203), now: 1), "w1", "a Market block is a block")
-        XCTAssertNil(ledger.block(assignment: a.id, nonce: 2, hash: target(203), now: 1), "a replay is never resubmitted")
-        XCTAssertNil(ledger.block(assignment: a.id, nonce: 3, hash: target(203), now: 30_000), "the work has expired")
+        let a = try ledger.assign(client: "a", on: nexus)
+        XCTAssertNil(ledger.block(assignment: a.id, nonce: 1, hash: target(205)))
+        XCTAssertEqual(ledger.block(assignment: a.id, nonce: 2, hash: target(203)), "w1", "a Market block is a block")
+        XCTAssertNil(ledger.block(assignment: a.id, nonce: 2, hash: target(203)), "a replay is never resubmitted")
     }
 
     /// A share refused credit is still the sponsor's block when it clears the
     /// submit target.
     func testAShareRefusedCreditIsStillABlock() throws {
         var ledger = ledger()
-        let a = try ledger.assign(client: "a", on: market, now: 0)
-        ledger.install(template(workID: "w2", marketHeight: 8), now: 1)
+        let a = try ledger.assign(client: "a", on: market)
+        ledger.install(template(workID: "w2", marketHeight: 8), clean: false, now: 1)
         XCTAssertThrowsError(try ledger.credit(assignment: a.id, nonce: 0, hash: target(203), now: 1)) {
             XCTAssertEqual($0 as? SponsorRefusal, .expired)
         }
-        XCTAssertEqual(ledger.block(assignment: a.id, nonce: 0, hash: target(203), now: 1), "w1")
+        XCTAssertEqual(ledger.block(assignment: a.id, nonce: 0, hash: target(203)), "w1")
     }
 
     func testAShareIsWorthItsChanceOfTheChainsBlockTimesItsReward() {
@@ -130,7 +124,7 @@ final class SponsorLedgerTests: XCTestCase {
     /// the chain its client named, at that template's price, and only there.
     func testCreditIsEarnedOnTheNamedChainAtTheSharesOwnTemplatesPrice() throws {
         var ledger = ledger()
-        let early = try ledger.assign(client: "a", on: market, now: 0)
+        let early = try ledger.assign(client: "a", on: market)
         for nonce in 0..<8 {
             _ = try ledger.credit(assignment: early.id, nonce: UInt64(nonce), hash: UInt256(1), now: 1)
         }
@@ -139,8 +133,8 @@ final class SponsorLedgerTests: XCTestCase {
 
         // Market's reward doubles: new work is worth twice as much there,
         // and work already done keeps the price it was done at.
-        ledger.install(template(workID: "w2", marketReward: 20), now: 2)
-        let late = try ledger.assign(client: "a", on: market, now: 2)
+        ledger.install(template(workID: "w2", marketReward: 20), clean: false, now: 2)
+        let late = try ledger.assign(client: "a", on: market)
         _ = try ledger.credit(assignment: early.id, nonce: 8, hash: UInt256(1), now: 3)
         for nonce in 0..<8 {
             _ = try ledger.credit(assignment: late.id, nonce: UInt64(nonce), hash: UInt256(1), now: 3)
@@ -153,15 +147,15 @@ final class SponsorLedgerTests: XCTestCase {
         try ledger.commit(client: "a", fee: 15, on: market, balance: 100, holdUntil: 600_000, now: 4)
         XCTAssertEqual(ledger.credit(of: "a", on: market), marketShare)
 
-        ledger.install(template(workID: "w3", marketReward: nil), now: 5)
-        XCTAssertThrowsError(try ledger.assign(client: "a", on: market, now: 5)) {
+        ledger.install(template(workID: "w3", marketReward: nil), clean: false, now: 5)
+        XCTAssertThrowsError(try ledger.assign(client: "a", on: market)) {
             XCTAssertEqual($0 as? SponsorRefusal, .unpriceable, "work on a template without Market's block buys nothing there")
         }
     }
 
     func testCommitSpendsCreditAndHoldsTheFeeAgainstTheFloat() throws {
         var ledger = ledger()
-        let a = try ledger.assign(client: "a", on: nexus, now: 0)
+        let a = try ledger.assign(client: "a", on: nexus)
         for nonce in 0..<2 {
             _ = try ledger.credit(assignment: a.id, nonce: UInt64(nonce), hash: UInt256(1), now: 1)
         }
@@ -174,7 +168,7 @@ final class SponsorLedgerTests: XCTestCase {
         try ledger.commit(client: "a", fee: 4, on: nexus, balance: 7, holdUntil: 600_000, now: 2)
         XCTAssertEqual(ledger.credit(of: "a", on: nexus), nexusShare * UInt256(2) - units(4))
 
-        let b = try ledger.assign(client: "b", on: nexus, now: 2)
+        let b = try ledger.assign(client: "b", on: nexus)
         for nonce in 100..<102 {
             _ = try ledger.credit(assignment: b.id, nonce: UInt64(nonce), hash: UInt256(1), now: 3)
         }
@@ -194,7 +188,7 @@ final class SponsorLedgerTests: XCTestCase {
         _ = try funds.credit(fund, coins: 5)
 
         var ledger = ledger()
-        let a = try ledger.assign(client: "a", on: nexus, now: 0)
+        let a = try ledger.assign(client: "a", on: nexus)
         for nonce in 0..<2 {
             _ = try ledger.credit(assignment: a.id, nonce: UInt64(nonce), hash: UInt256(1), now: 1)
         }
@@ -227,8 +221,8 @@ final class SponsorLedgerTests: XCTestCase {
     /// backs, over every client, stops at its reward.
     func testCreditAtAHeightStopsAtItsBlocksReward() throws {
         var ledger = ledger()
-        let a = try ledger.assign(client: "a", on: market, now: 0)
-        let b = try ledger.assign(client: "b", on: market, now: 0)
+        let a = try ledger.assign(client: "a", on: market)
+        let b = try ledger.assign(client: "b", on: market)
         for nonce in 0..<10 {
             _ = try ledger.credit(assignment: a.id, nonce: UInt64(nonce), hash: UInt256(1), now: 1)
         }
@@ -239,19 +233,19 @@ final class SponsorLedgerTests: XCTestCase {
         XCTAssertThrowsError(try ledger.credit(assignment: b.id, nonce: 106, hash: UInt256(1), now: 1)) {
             XCTAssertEqual($0 as? SponsorRefusal, .soldOut)
         }
-        XCTAssertThrowsError(try ledger.assign(client: "c", on: market, now: 1)) {
+        XCTAssertThrowsError(try ledger.assign(client: "c", on: market)) {
             XCTAssertEqual($0 as? SponsorRefusal, .soldOut)
         }
-        ledger.install(template(workID: "w2", marketHeight: 8), now: 2)
-        XCTAssertNoThrow(try ledger.assign(client: "c", on: market, now: 2), "the next height backs credit anew")
+        ledger.install(template(workID: "w2", marketHeight: 8), clean: false, now: 2)
+        XCTAssertNoThrow(try ledger.assign(client: "c", on: market), "the next height backs credit anew")
     }
 
     /// Once the chain moves past the block a template carries, work on that
     /// template can no longer win it and earns nothing.
     func testWorkOnAHeightTheChainHasPassedEarnsNothing() throws {
         var ledger = ledger()
-        let a = try ledger.assign(client: "a", on: market, now: 0)
-        ledger.install(template(workID: "w2", marketHeight: 8), now: 1)
+        let a = try ledger.assign(client: "a", on: market)
+        ledger.install(template(workID: "w2", marketHeight: 8), clean: false, now: 1)
         XCTAssertThrowsError(try ledger.credit(assignment: a.id, nonce: 0, hash: UInt256(1), now: 1)) {
             XCTAssertEqual($0 as? SponsorRefusal, .expired)
         }
@@ -262,39 +256,119 @@ final class SponsorLedgerTests: XCTestCase {
     /// chain moved past it.
     func testAChainMissingFromOneRefreshKeepsItsHeightsBackingAndStaleness() throws {
         var ledger = ledger()
-        let a = try ledger.assign(client: "a", on: market, now: 0)
+        let a = try ledger.assign(client: "a", on: market)
         for nonce in 0..<16 {
             _ = try ledger.credit(assignment: a.id, nonce: UInt64(nonce), hash: UInt256(1), now: 1)
         }
-        ledger.install(template(workID: "w2", marketReward: nil), now: 2)
+        ledger.install(template(workID: "w2", marketReward: nil), clean: false, now: 2)
         XCTAssertThrowsError(try ledger.credit(assignment: a.id, nonce: 16, hash: UInt256(1), now: 2)) {
             XCTAssertEqual($0 as? SponsorRefusal, .soldOut, "the height's reward is still spent")
         }
-        ledger.install(template(workID: "w3", marketHeight: 7), now: 3)
-        XCTAssertThrowsError(try ledger.assign(client: "b", on: market, now: 3)) {
+        ledger.install(template(workID: "w3", marketHeight: 7), clean: false, now: 3)
+        XCTAssertThrowsError(try ledger.assign(client: "b", on: market)) {
             XCTAssertEqual($0 as? SponsorRefusal, .soldOut)
         }
 
         var moved = self.ledger()
-        let b = try moved.assign(client: "b", on: market, now: 0)
-        moved.install(template(workID: "w2", marketHeight: 8), now: 1)
-        moved.install(template(workID: "w3", marketReward: nil), now: 2)
+        let b = try moved.assign(client: "b", on: market)
+        moved.install(template(workID: "w2", marketHeight: 8), clean: false, now: 1)
+        moved.install(template(workID: "w3", marketReward: nil), clean: false, now: 2)
         XCTAssertThrowsError(try moved.credit(assignment: b.id, nonce: 0, hash: UInt256(1), now: 2)) {
             XCTAssertEqual($0 as? SponsorRefusal, .expired, "a live template still shows the chain at 8")
         }
     }
 
-    /// After a reorg to a lower height, no range is handed out that a live
+    /// After a reorg to a lower height, no range is handed out that a held
     /// template's higher height would refuse.
-    func testNoWorkIsAssignedBelowALiveTemplatesHeight() throws {
+    func testNoWorkIsAssignedBelowAHeldTemplatesHeight() throws {
         var ledger = ledger()
-        ledger.install(template(workID: "w0", marketHeight: 8), now: 0)
-        ledger.install(template(workID: "w2", marketHeight: 7), now: 1)
-        XCTAssertThrowsError(try ledger.assign(client: "a", on: market, now: 1)) {
+        ledger.install(template(workID: "w0", marketHeight: 8), clean: false, now: 0)
+        ledger.install(template(workID: "w2", marketHeight: 7), clean: false, now: 1)
+        XCTAssertThrowsError(try ledger.assign(client: "a", on: market)) {
             XCTAssertEqual($0 as? SponsorRefusal, .busy)
         }
-        ledger.install(template(workID: "w3", marketHeight: 7, expiresAt: 60_000), now: 30_000)
-        XCTAssertNoThrow(try ledger.assign(client: "a", on: market, now: 30_000), "once the higher template expires")
+        ledger.install(template(workID: "w3", marketHeight: 7), clean: true, now: 2)
+        XCTAssertNoThrow(try ledger.assign(client: "a", on: market), "once a clean template retires the higher one")
+    }
+
+    /// Proof-of-work arrivals are memoryless: however long a template has
+    /// been the newest, its work, its price and its blocks stand.
+    func testWorkNeverExpiresOnAClock() throws {
+        var ledger = ledger()
+        let a = try ledger.assign(client: "a", on: nexus)
+        let late: Int64 = 1_000_000_000_000
+        XCTAssertEqual(try ledger.credit(assignment: a.id, nonce: 1, hash: UInt256(1), now: late), nexusShare)
+        XCTAssertEqual(ledger.block(assignment: a.id, nonce: 2, hash: target(203)), "w1")
+        XCTAssertEqual(ledger.latest?.workID, "w1")
+        XCTAssertNoThrow(try ledger.assign(client: "b", on: nexus))
+        XCTAssertEqual(ledger.sharesFor(fee: 1_000, on: nexus), UInt256(256))
+    }
+
+    /// Only the pool or a hosted chain moved: earlier work stays valid, and
+    /// new work is handed out on the new template.
+    func testATemplateThatIsNotCleanKeepsEarlierWork() throws {
+        var ledger = ledger()
+        let a = try ledger.assign(client: "a", on: nexus)
+        ledger.install(template(workID: "w2"), clean: false, now: 1)
+        let b = try ledger.assign(client: "b", on: nexus)
+        XCTAssertEqual(b.workID, "w2")
+        XCTAssertEqual(try ledger.credit(assignment: a.id, nonce: 1, hash: UInt256(1), now: 2), nexusShare)
+        XCTAssertEqual(ledger.block(assignment: a.id, nonce: 2, hash: target(203)), "w1")
+    }
+
+    /// A clean template is the node's word that earlier work is gone: shares
+    /// on it are refused, and it is no block.
+    func testACleanTemplateRetiresEarlierWork() throws {
+        var ledger = ledger()
+        let a = try ledger.assign(client: "a", on: nexus)
+        _ = try ledger.credit(assignment: a.id, nonce: 0, hash: UInt256(1), now: 1)
+        ledger.install(template(workID: "w2"), clean: true, now: 2)
+        XCTAssertThrowsError(try ledger.credit(assignment: a.id, nonce: 1, hash: UInt256(1), now: 2)) {
+            XCTAssertEqual($0 as? SponsorRefusal, .unknownAssignment)
+        }
+        XCTAssertNil(ledger.block(assignment: a.id, nonce: 2, hash: target(203)))
+        XCTAssertEqual(ledger.credit(of: "a", on: nexus), nexusShare, "credit already earned stays")
+        XCTAssertEqual(try ledger.assign(client: "a", on: nexus).workID, "w2")
+    }
+
+    /// A reconnect's first push is clean; when it repeats the work in hand,
+    /// that work is still the node's and stays valid.
+    func testACleanTemplateRepeatingHeldWorkKeepsIt() throws {
+        var ledger = ledger()
+        let a = try ledger.assign(client: "a", on: nexus)
+        ledger.install(template(), clean: true, now: 1)
+        XCTAssertEqual(try ledger.credit(assignment: a.id, nonce: 1, hash: UInt256(1), now: 2), nexusShare)
+    }
+
+    /// Unheard, the sponsor hands out no work and prices nothing; work
+    /// already handed out is still credited and its blocks still submitted.
+    func testDisconnectedHandsOutNothingButKeepsWorkHandedOut() throws {
+        var ledger = ledger()
+        let a = try ledger.assign(client: "a", on: nexus)
+        ledger.disconnect()
+        XCTAssertNil(ledger.latest)
+        XCTAssertThrowsError(try ledger.assign(client: "b", on: nexus)) {
+            XCTAssertEqual($0 as? SponsorRefusal, .unpriceable)
+        }
+        XCTAssertNil(ledger.sharesFor(fee: 1, on: nexus))
+        XCTAssertEqual(try ledger.credit(assignment: a.id, nonce: 1, hash: UInt256(1), now: 2), nexusShare)
+        XCTAssertEqual(ledger.block(assignment: a.id, nonce: 2, hash: target(203)), "w1")
+        ledger.install(template(workID: "w2"), clean: false, now: 3)
+        XCTAssertNoThrow(try ledger.assign(client: "b", on: nexus), "heard again")
+    }
+
+    /// Between clean templates, the most held is bounded: the oldest go first.
+    func testTemplatesPastTheCapDropOldestFirst() throws {
+        var ledger = SponsorLedger(shareTarget: target(208), rangeSize: 100, maxTemplates: 2)
+        ledger.install(template(), clean: false, now: 0)
+        let a = try ledger.assign(client: "a", on: nexus)
+        ledger.install(template(workID: "w2"), clean: false, now: 1)
+        let b = try ledger.assign(client: "b", on: nexus)
+        ledger.install(template(workID: "w3"), clean: false, now: 2)
+        XCTAssertThrowsError(try ledger.credit(assignment: a.id, nonce: 1, hash: UInt256(1), now: 3)) {
+            XCTAssertEqual($0 as? SponsorRefusal, .unknownAssignment)
+        }
+        XCTAssertNoThrow(try ledger.credit(assignment: b.id, nonce: 1, hash: UInt256(1), now: 3))
     }
 
     func testSponsoredBodyAddsOnlyTheFeeAndCoSigns() throws {

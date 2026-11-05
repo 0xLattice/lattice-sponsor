@@ -73,9 +73,8 @@ final class StorageCreditTests: XCTestCase {
             workID: "w1",
             prefixHex: "00",
             prices: [market: ChainPrice(target: (UInt256(1) << 204) - UInt256(1), height: 7, reward: 10)],
-            submitTarget: .zero,
-            expiresAt: 30_000
-        ), now: 0)
+            submitTarget: .zero
+        ), clean: false, now: 0)
         return ledger
     }
 
@@ -92,7 +91,7 @@ final class StorageCreditTests: XCTestCase {
     /// Pay `shares` shares of Market work to `root`.
     private func pay(_ shares: UInt64, to root: String, _ storage: inout StorageLedger) throws {
         var ledger = ledger()
-        let a = try ledger.assign(client: "a", on: market, store: root, now: 0)
+        let a = try ledger.assign(client: "a", on: market, store: root)
         for nonce in 0..<shares {
             let value = try ledger.credit(assignment: a.id, nonce: nonce, hash: UInt256(1), now: 1)
             try storage.credit(root: root, value: value, on: market, now: 1)

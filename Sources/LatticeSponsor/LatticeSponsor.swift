@@ -196,25 +196,38 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
         let templates = HTTPMiningCoordinatorNodeClient(
             apiBaseURL: base, cookieFile: URL(fileURLWithPath: cookieFile)
         )
-        let refresh = Task {
+        // The node pushes each template as it builds it: no new tip, no new
+        // template, however long that takes. Hosted chains come and go
+        // without a restart, so each connection asks for all of them.
+        let feed = Task {
+            let backoff = Duration.milliseconds(250)
+            var wait = backoff
+            var subscribe = true
             while !Task.isCancelled {
                 do {
-                    // Hosted chains come and go without a restart.
-                    let chains = [DEFAULT_ROOT_DIRECTORY] + (try await rpc.hostedChains())
-                    let request = try MiningTemplateRequestBody.make(
-                        recipients: chains.map { "\($0)=\(signer.address)" }, minimumWork: []
-                    )
-                    let fetchedAt = now()
-                    if let template = try await rpc.template(request) {
-                        await sponsor.install(template, fetchedAt: fetchedAt)
+                    if subscribe {
+                        for try await push in rpc.subscribe(try await templateRequest(rpc, signer.address)) {
+                            await sponsor.install(push.template, clean: push.clean)
+                            wait = backoff
+                        }
+                        print("template subscription ended")
+                    } else {
+                        try await poll(rpc, signer.address, into: sponsor) { wait = backoff }
                     }
+                } catch SponsorRPC.RPCFailure.noSubscription {
+                    print("the node has no template subscription: asking for templates instead; upgrade the node")
+                    subscribe = false
+                    continue
                 } catch {
-                    print("template fetch failed: \(error)")
+                    print("template feed: \(error)")
                 }
-                try? await Task.sleep(for: .seconds(5))
+                // Unheard, the sponsor prices nothing; work handed out stays valid.
+                await sponsor.disconnect()
+                try? await Task.sleep(for: wait)
+                wait = min(wait * 2, .seconds(5))
             }
         }
-        defer { refresh.cancel() }
+        defer { feed.cancel() }
 
         let router = Router()
         // Wallets call this from web pages. No cookie or credential rides on
@@ -335,7 +348,13 @@ struct WorkResponse: ResponseEncodable {
     /// Shares that buy `fee` and `pay` at the current price, saturating
     /// (zero, with `fee` and `pay`, for storage or serving work).
     @DecimalString var sharesForFee: UInt64
+    /// Not a deadline: work stays valid until the chain's tip moves (a
+    /// share on retired work is refused, and the client asks again), since
+    /// proof-of-work arrivals are memoryless. Wallets require the field and
+    /// ask for new work when it runs out, so it carries a long constant.
     @DecimalString var expiresInMilliseconds: UInt64
+
+    static let askAgainMilliseconds: UInt64 = 3_600_000
 }
 
 struct ShareRequest: Decodable {
@@ -424,7 +443,7 @@ actor Sponsor {
     /// Each chain's reward schedule, read once.
     private var specs: [[String]: ChainSpec] = [:]
     /// Each chain's fee and the sponsor's balance there, read at every
-    /// refresh so a request reads nothing from the node.
+    /// template so a request reads nothing from the node.
     private var fees: [[String]: UInt64] = [:]
     private var balances: [[String]: UInt64] = [:]
     /// Uploads and the roots pinned, with --sell-storage.
@@ -463,8 +482,8 @@ actor Sponsor {
 
     /// Take `template` as the newest work, priced on every chain whose block
     /// it carries pays this sponsor. A chain whose spec or fee cannot be read
-    /// is left unpriced.
-    func install(_ template: MiningTemplateResponse, fetchedAt: Int64) async {
+    /// is left unpriced. `clean`: work on earlier templates is gone.
+    func install(_ template: MiningTemplateResponse, clean: Bool) async {
         var prices: [[String]: ChainPrice] = [:]
         for chain in template.chains ?? [] where chain.rewardRecipient == key.address {
             if specs[chain.chainPath] == nil {
@@ -488,11 +507,13 @@ actor Sponsor {
             prefixHex: ProofOfWork.proofOfWorkHashPrefixBytes(template.block)
                 .map { String(format: "%02x", $0) }.joined(),
             prices: prices,
-            submitTarget: template.searchTarget,
-            // From the fetch, not after the reads above: a slow read must
-            // not outlive the node's own expiry.
-            expiresAt: fetchedAt + Int64(clamping: template.expiresInMilliseconds)
-        ), now: now())
+            submitTarget: template.searchTarget
+        ), clean: clean, now: now())
+    }
+
+    /// The node cannot be heard: price nothing until a template comes again.
+    func disconnect() {
+        ledger.disconnect()
     }
 
     func work(client: String?, chainPath: [String], pay: UInt64, store: String?, peer: String?) throws -> WorkResponse {
@@ -515,7 +536,7 @@ actor Sponsor {
             guard isIssued(token) else { throw SponsorRefusal.draft("unknown client token") }
             return token
         } ?? issueToken()
-        let assignment = try ledger.assign(client: client, on: chainPath, store: store, peer: peer, now: now())
+        let assignment = try ledger.assign(client: client, on: chainPath, store: store, peer: peer)
         if store == nil, peer == nil {
             shares = ledger.sharesFor(fee: total, on: chainPath) ?? .max
         }
@@ -529,7 +550,7 @@ actor Sponsor {
             fee: fee,
             pay: pay,
             sharesForFee: shares > UInt256(UInt64.max) ? .max : UInt64(shares.words[0]),
-            expiresInMilliseconds: UInt64(max(0, assignment.expiresAt - now()))
+            expiresInMilliseconds: WorkResponse.askAgainMilliseconds
         )
     }
 
@@ -558,7 +579,7 @@ actor Sponsor {
                 serving: try held.peer.map { _ in UInt64(try serving.bytes(for: value, on: held.chainPath)) }
             )
         }
-        return (credited, ledger.block(assignment: assignment, nonce: nonce, hash: hash, now: now()), held)
+        return (credited, ledger.block(assignment: assignment, nonce: nonce, hash: hash), held)
     }
 
     func upload(root: String, volumes: [StoreVolume]) throws -> StoreResponse {
@@ -704,9 +725,9 @@ actor Sponsor {
     }
 
     private func currentFee(_ chainPath: [String]) throws -> UInt64 {
-        // An expired template means refresh has stopped, and the balance
-        // read with it may no longer show fees already mined.
-        guard let latest = ledger.latest, now() < latest.expiresAt,
+        // No template: the node cannot be heard, and the balance read with
+        // the last one may no longer show fees since mined.
+        guard let latest = ledger.latest,
               latest.prices[chainPath] != nil, let fee = fees[chainPath] else {
             throw SponsorRefusal.unpriceable
         }
@@ -806,9 +827,47 @@ struct SponsorRPC: Sendable {
         request.httpBody = body
         let (data, response) = try await URLSession.shared.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        if status == 409 || status == 503 { return nil }
+        if status == 409 || status == 503 {
+            print("the node gave no template (\(status)): \(String(decoding: data, as: UTF8.self))")
+            return nil
+        }
         guard status == 200 else { throw RPCFailure.status(status) }
         return try JSONDecoder().decode(MiningTemplateResponse.self, from: data)
+    }
+
+    /// The node's templates as it builds them, over one connection, until it
+    /// ends. `RPCFailure.noSubscription`: the node has no subscription route.
+    func subscribe(_ body: Data) -> AsyncThrowingStream<(template: MiningTemplateResponse, clean: Bool), any Error> {
+        var request = authorized(base.appendingPathComponent("mining/templates/subscribe"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.httpBody = body
+        // The node writes a keepalive comment every 15 s: a connection
+        // silent for longer is dead, whatever the chain does.
+        request.timeoutInterval = 60
+        return AsyncThrowingStream { continuation in
+            let events = EventStreamDelegate { event in
+                switch event.name {
+                case "template":
+                    do {
+                        let template = try JSONDecoder().decode(MiningTemplateResponse.self, from: event.data)
+                        // A node's first push to a connection is clean.
+                        continuation.yield((template, template.clean ?? true))
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
+                case "end":
+                    print("the node ended the template subscription: \(String(decoding: event.data, as: UTF8.self))")
+                    continuation.finish()
+                default:
+                    break
+                }
+            } finished: { continuation.finish(throwing: $0) }
+            let session = URLSession(configuration: .default, delegate: events, delegateQueue: nil)
+            session.dataTask(with: request).resume()
+            continuation.onTermination = { _ in session.invalidateAndCancel() }
+        }
     }
 
     func spec(_ chainPath: [String]) async throws -> ChainSpec {
@@ -843,6 +902,8 @@ struct SponsorRPC: Sendable {
 
     enum RPCFailure: Error {
         case notFound
+        /// The node predates `POST /mining/templates/subscribe`.
+        case noSubscription
         case status(Int)
     }
 
@@ -868,6 +929,69 @@ struct SponsorRPC: Sendable {
         if status == 404 { throw RPCFailure.notFound }
         guard status == 200 else { throw RPCFailure.status(status) }
         return try JSONDecoder().decode(Value.self, from: data)
+    }
+}
+
+/// The template request for Nexus and every chain the node hosts, each
+/// paying `address`.
+private func templateRequest(_ rpc: SponsorRPC, _ address: String) async throws -> Data {
+    let chains = [DEFAULT_ROOT_DIRECTORY] + (try await rpc.hostedChains())
+    return try MiningTemplateRequestBody.make(recipients: chains.map { "\($0)=\(address)" }, minimumWork: [])
+}
+
+/// Against a node without the subscription route: ask every few seconds,
+/// and take a template on a new root tip as clean. Returns or throws only
+/// when the node cannot be heard.
+private func poll(_ rpc: SponsorRPC, _ address: String, into sponsor: Sponsor, heard: () -> Void) async throws {
+    var tip: String??
+    while !Task.isCancelled {
+        if let template = try await rpc.template(try await templateRequest(rpc, address)) {
+            let parent = template.block.parent?.rawCID
+            await sponsor.install(template, clean: tip != .some(parent))
+            tip = .some(parent)
+            heard()
+        }
+        try await Task.sleep(for: .seconds(5))
+    }
+}
+
+/// A `text/event-stream` response's events, as URLSession delivers its
+/// bytes (corelibs Foundation streams through a data delegate on Linux too).
+private final class EventStreamDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let event: @Sendable (ServerSentEvent) -> Void
+    private let finished: @Sendable ((any Error)?) -> Void
+    private let lock = NSLock()
+    private var parser = ServerSentEventParser()
+
+    init(event: @escaping @Sendable (ServerSentEvent) -> Void, finished: @escaping @Sendable ((any Error)?) -> Void) {
+        self.event = event
+        self.finished = finished
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void
+    ) {
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200 else {
+            finished(status == 404 ? SponsorRPC.RPCFailure.noSubscription : SponsorRPC.RPCFailure.status(status))
+            return completionHandler(.cancel)
+        }
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        lock.lock()
+        let events = parser.feed(data)
+        lock.unlock()
+        for next in events { event(next) }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
+        finished(error)
+        session.finishTasksAndInvalidate()
     }
 }
 

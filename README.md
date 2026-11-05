@@ -18,7 +18,12 @@ win.
 ## Running it
 
 It runs beside a node and reaches it only over the node's loopback RPC, as a
-miner does.
+miner does. The node pushes each new template as it builds it
+(`POST /mining/templates/subscribe`), and work never expires on a clock: a
+range stays valid until the node says the tip moved, since proof-of-work
+arrivals are memoryless. While the sponsor cannot hear its node it prices
+nothing (`unpriceable`). Against a node without the subscription route, it
+asks for a template every few seconds instead.
 
 ```sh
 lattice-sponsor \
