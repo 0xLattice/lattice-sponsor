@@ -156,6 +156,12 @@ public struct SponsorLedger: Sendable {
     private var templates: [String: SponsorTemplate] = [:]
     /// `templates`' work IDs, oldest first.
     private var order: [String] = []
+    /// The templates last retired and their assignments: no longer credited,
+    /// but a share on them that clears the submit target still goes to the
+    /// node, which judges it (a reconnect's clean push may retire work the
+    /// node still holds).
+    private var retiredTemplates: [String: SponsorTemplate] = [:]
+    private var retiredAssignments: [String: ShareAssignment] = [:]
     private var nextStart: [String: UInt64] = [:]
     private var assignments: [String: ShareAssignment] = [:]
     private var shares: Set<ShareKey> = []
@@ -315,7 +321,8 @@ public struct SponsorLedger: Sendable {
     /// moved on) can still be the sponsor's block on another chain, and the
     /// node judges it.
     public mutating func block(assignment id: String, nonce: UInt64, hash: UInt256) -> String? {
-        guard let assignment = assignments[id], let template = templates[assignment.workID],
+        guard let assignment = assignments[id] ?? retiredAssignments[id],
+              let template = templates[assignment.workID] ?? retiredTemplates[assignment.workID],
               hash <= template.submitTarget,
               submitted.insert(ShareKey(workID: template.workID, nonce: nonce)).inserted else { return nil }
         return template.workID
@@ -328,8 +335,9 @@ public struct SponsorLedger: Sendable {
         templates.values.compactMap { $0.prices[chainPath]?.height }.max()
     }
 
+    /// The assignment `id`, held or last retired.
     public func assignment(_ id: String) -> ShareAssignment? {
-        assignments[id]
+        assignments[id] ?? retiredAssignments[id]
     }
 
     /// `client`'s credit on `chainPath`, in units scaled by 2^64.
@@ -387,10 +395,14 @@ public struct SponsorLedger: Sendable {
         }
     }
 
-    /// Drop `workIDs`' templates and the work handed out on them.
+    /// Retire `workIDs`' templates and the work handed out on them, and
+    /// forget those retired before.
     private mutating func retire(_ workIDs: [String]) {
         guard !workIDs.isEmpty else { return }
         let gone = Set(workIDs)
+        let forgotten = Set(retiredTemplates.keys)
+        retiredTemplates = templates.filter { gone.contains($0.key) }
+        retiredAssignments = assignments.filter { gone.contains($0.value.workID) }
         for workID in gone {
             templates.removeValue(forKey: workID)
             nextStart.removeValue(forKey: workID)
@@ -398,7 +410,7 @@ public struct SponsorLedger: Sendable {
         order.removeAll { gone.contains($0) }
         assignments = assignments.filter { !gone.contains($0.value.workID) }
         shares = shares.filter { !gone.contains($0.workID) }
-        submitted = submitted.filter { !gone.contains($0.workID) }
+        submitted = submitted.filter { !forgotten.contains($0.workID) || gone.contains($0.workID) }
     }
 
     private mutating func prune(now: Int64) {

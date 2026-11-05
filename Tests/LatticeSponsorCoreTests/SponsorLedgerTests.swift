@@ -317,7 +317,7 @@ final class SponsorLedgerTests: XCTestCase {
     }
 
     /// A clean template is the node's word that earlier work is gone: shares
-    /// on it are refused, and it is no block.
+    /// on it earn nothing, though a block on it is still the node's to judge.
     func testACleanTemplateRetiresEarlierWork() throws {
         var ledger = ledger()
         let a = try ledger.assign(client: "a", on: nexus)
@@ -326,9 +326,15 @@ final class SponsorLedgerTests: XCTestCase {
         XCTAssertThrowsError(try ledger.credit(assignment: a.id, nonce: 1, hash: UInt256(1), now: 2)) {
             XCTAssertEqual($0 as? SponsorRefusal, .unknownAssignment)
         }
-        XCTAssertNil(ledger.block(assignment: a.id, nonce: 2, hash: target(203)))
+        XCTAssertEqual(
+            ledger.block(assignment: a.id, nonce: 2, hash: target(203)), "w1",
+            "a block on retired work still goes to the node, which judges it"
+        )
+        XCTAssertNil(ledger.block(assignment: a.id, nonce: 2, hash: target(203)), "once")
         XCTAssertEqual(ledger.credit(of: "a", on: nexus), nexusShare, "credit already earned stays")
         XCTAssertEqual(try ledger.assign(client: "a", on: nexus).workID, "w2")
+        ledger.install(template(workID: "w3"), clean: true, now: 3)
+        XCTAssertNil(ledger.block(assignment: a.id, nonce: 3, hash: target(203)), "two clean pushes on, it is forgotten")
     }
 
     /// A reconnect's first push is clean; when it repeats the work in hand,
