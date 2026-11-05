@@ -18,7 +18,11 @@ win.
 ## Running it
 
 It runs beside a node and reaches it only over the node's loopback RPC, as a
-miner does.
+miner does. It asks for a template whenever the node reports a change
+(`GET /mining/events`: a hosted chain's tip or pool, or the hosted set), never
+on a clock: proof-of-work arrivals are memoryless, so work stays valid until a
+template on a new tip replaces it. It needs a node with that route; against an
+older one it logs the failure and keeps retrying.
 
 ```sh
 lattice-sponsor \

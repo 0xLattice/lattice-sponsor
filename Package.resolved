@@ -1,5 +1,5 @@
 {
-  "originHash": "1c221c97e2712bb18f8bd8b0892b1cf2c8abc5bc5c97a519fdcdc2c51be3b645",
+  "originHash": "2b103821b5a198d4881bf9b2b1d297bc14073df9b73579812da233ffb25955a1",
   "pins": [
     {
       "identity": "arraytrie",
@@ -60,8 +60,8 @@
       "kind": "remoteSourceControl",
       "location": "https://github.com/0xLattice/Ivy2.git",
       "state": {
-        "revision": "ed877d4da0a501c487db2e08f9e1812c2acc9dcd",
-        "version": "2.3.0"
+        "revision": "cc67fa9c4dd9f7566e13a70f9221af6313af88aa",
+        "version": "3.1.1"
       }
     },
     {
@@ -69,8 +69,8 @@
       "kind": "remoteSourceControl",
       "location": "https://github.com/0xLattice/Lattice.git",
       "state": {
-        "revision": "282ea57284a3f55c7e36252181ee277aad800ea7",
-        "version": "54.2.1"
+        "revision": "9947a23d72578257388263fcd623cd4621fb31a3",
+        "version": "56.1.2"
       }
     },
     {
@@ -78,13 +78,13 @@
       "kind": "remoteSourceControl",
       "location": "https://github.com/0xLattice/lattice-node.git",
       "state": {
-        "revision": "9abd15b1bb05a0d4305e83f64c4676a6e296071f"
+        "revision": "6237c0e7d436e0c9a8cf97b88da944f197788ccd"
       }
     },
     {
       "identity": "multikey",
       "kind": "remoteSourceControl",
-      "location": "https://github.com/adalinxx/Multikey.git",
+      "location": "https://github.com/0xLattice/Multikey.git",
       "state": {
         "revision": "413c70e96c4de9af573e16b58ffc6a107911eb9f",
         "version": "1.0.0"
@@ -356,8 +356,8 @@
       "kind": "remoteSourceControl",
       "location": "https://github.com/0xLattice/Tally.git",
       "state": {
-        "revision": "63919ea78de06bc493fe5913dcfcdaad4edabdf6",
-        "version": "3.1.1"
+        "revision": "f8b80ee09a1ed5768f2263ff71c7c745bf946922",
+        "version": "4.0.0"
       }
     },
     {
@@ -383,8 +383,8 @@
       "kind": "remoteSourceControl",
       "location": "https://github.com/0xLattice/VolumeBroker.git",
       "state": {
-        "revision": "095c70f757a53c9a57eee6461aa7c58a7e220cae",
-        "version": "9.2.3"
+        "revision": "5780a13de702a1cb929e838e79cca8b06cd8c636",
+        "version": "9.3.0"
       }
     },
     {
