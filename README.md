@@ -177,17 +177,27 @@ any other address funds nothing. `signature` is over
 normalized and joined by `\n`. What the transaction pays the sponsor, net, is
 added to the fund's deposit, once per transaction; the answer is
 `{bytes: "0", deposit}`. Deposits are kept in `lattice-sponsor-funds.json`
-beside `--storage-file`, so they survive a restart. There is no withdrawal
-yet.
+beside `--storage-file`, and every fee held in `lattice-sponsor-holds.json`
+beside it, so both survive a restart. There is no withdrawal yet.
 
 A reader names the fund on `POST /sponsor` as `fund: [prefix, ...]`. The fund
 backs the transaction when the transaction writes at least one key, every key
 it writes starts with one of the fund's prefixes, and the fee and `pay` fit in
-the deposit beside what the fund already holds: the fees and pays signed under
-it whose hold has not expired. A backed transaction is held against the fund;
-any other is held against the operator's own float, as without funds, or with
-`--funded-only`, refused `notFunded` (402). Either way the key's whole balance
-must still cover every hold (`insufficientFloat`).
+the deposit beside what the fund already holds, and its signer holds no
+transaction under the fund at another nonce. A backed transaction is held
+against the fund; any other is held against the operator's own float, as
+without funds. With `--funded-only` it is refused instead: `inFlight` (409)
+when the signer already holds one under the fund, else `notFunded` (402).
+Either way the key's whole balance must still cover every hold
+(`insufficientFloat`).
+
+A hold lasts until the signer's nonce on the chain passes the transaction's:
+it landed, or another transaction took its nonce and it never can. The sponsor
+reads the nonces whenever the node reports a change, never on a clock. A
+transaction the host dropped stays held, since it can still be resubmitted;
+one signer holds one at a time under a fund, so a reader who never submits
+keeps at most one fee of it. A redraft at the held nonce replaces the hold,
+keeping the larger amount, since only one of the two can land.
 `GET /fund?chain=<path>&prefix=<p>&prefix=<q>` answers `{deposit, held}`;
 room for more is `deposit - held`.
 
@@ -200,10 +210,10 @@ block reward) per transaction, from the key's balance, which also holds the
 blocks the sponsor wins. The float is the operator's bound on that loss; set
 `--most-pay 0` to keep it to fees.
 
-A signed fee and pay are held against the float for a few of the chain's
-blocks, but a client may submit its body later than that. The sponsor never
-pays more than one fee and pay per signature, so the cost is another client's
-sponsored transaction failing on an empty float.
+A signed fee and pay are held against the float until the client's nonce
+passes them, so a body never submitted stays held. Its client paid for it in
+work, which earns the key as much on average. Without `--funds`, holds are
+kept in memory, and a restart forgets them.
 
 A fund's deposit joins the key's one balance, so its luck is shared: blocks
 the readers' work fails to win, and shares withheld by any client, cost every

@@ -15,10 +15,11 @@
 //
 // A client can withhold the shares that are blocks, as against any pool;
 // nothing here detects it. The float is the operator's bound on that loss.
-// A signed fee is held against the float for a few of its chain's blocks,
-// but a client may submit its body later than that; the sponsor never pays
-// more than one fee per signature, so the cost is another client's
-// sponsored transaction failing on an empty float. A chain's reward schedule
+// A signed fee is held against the float until the client's nonce on its
+// chain passes the transaction's, read as the chain moves, never on a clock:
+// the transaction landed, or another took its nonce and it never can. One
+// never submitted stays held; its client paid its fee in work, which earns
+// the key as much on average. A chain's reward schedule
 // is read once, so a chain re-hosted under the same path with a new genesis
 // needs a restart.
 //
@@ -44,10 +45,11 @@
 // prefixes) adds to that fund's deposit: float a site lends the sponsor. A
 // sponsored transaction that names the fund and writes only keys under its
 // prefixes is held against the deposit instead of the operator's own float,
-// while the fund's unexpired holds fit in it. Nothing is drawn from a deposit:
-// the client still buys the fee with work, which repays it. With
-// --funded-only, only such transactions are sponsored. Deposits are kept
-// beside --storage-file, and cannot be withdrawn yet.
+// while the fund's holds fit in it, and the signer holds no other transaction
+// under it. Nothing is drawn from a deposit: the client still buys the fee
+// with work, which repays it. With --funded-only, only such transactions are
+// sponsored. Deposits and holds are kept beside --storage-file, and deposits
+// cannot be withdrawn yet.
 //
 // Routes (JSON, 64-bit integers as decimal strings, targets and work as hex):
 //   POST /work     {client?, chain?, pay?, store?|peer?} → a nonce range of the template
@@ -177,8 +179,11 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
         let payments = payTo != nil || funds
             ? try PaymentLedger(file: directory.appendingPathComponent("lattice-sponsor-payments.json")) : nil
         let fundLedger = funds ? try FundLedger(file: directory.appendingPathComponent("lattice-sponsor-funds.json")) : nil
+        var ledger = SponsorLedger(shareTarget: minimumWorkTarget(work))
+        // A fee signed before a restart can still land, against a fund too.
+        if funds { try ledger.keepHolds(in: directory.appendingPathComponent("lattice-sponsor-holds.json")) }
         let sponsor = Sponsor(
-            ledger: SponsorLedger(shareTarget: minimumWorkTarget(work)),
+            ledger: ledger,
             rpc: rpc,
             key: signer,
             minimumFee: fee,
@@ -392,8 +397,8 @@ struct PayResponse: ResponseEncodable {
 struct FundResponse: ResponseEncodable {
     /// The coins deposited, never drawn.
     @DecimalString var deposit: UInt64
-    /// What the fund backs now: fees and pays signed under it and not yet
-    /// expired. Room for more is `deposit - held`.
+    /// What the fund backs now: fees and pays signed under it whose signer's
+    /// nonce has not passed them. Room for more is `deposit - held`.
     @DecimalString var held: UInt64
 }
 
@@ -472,6 +477,13 @@ actor Sponsor {
     /// it carries pays this sponsor. A chain whose spec or fee cannot be read
     /// is left unpriced. `fresh`: the first since connecting to the node.
     func install(_ template: MiningTemplateResponse, fresh: Bool) async {
+        // Holds end as their signers' nonces pass them. Read before the
+        // balances: a fee that lands between the two reads is then counted
+        // twice until the next template, never not at all.
+        var nextNonces: [SponsorLedger.Holder: UInt64] = [:]
+        for holder in ledger.holders {
+            nextNonces[holder] = try? await rpc.nextNonce(of: holder.signer, on: holder.chainPath)
+        }
         var prices: [[String]: ChainPrice] = [:]
         for chain in template.chains ?? [] where chain.rewardRecipient == key.address {
             if specs[chain.chainPath] == nil {
@@ -498,6 +510,11 @@ actor Sponsor {
             submitTarget: template.searchTarget,
             parent: template.block.parent?.rawCID ?? ""
         ), fresh: fresh, now: now())
+        do {
+            try ledger.release(nextNonces: nextNonces)
+        } catch {
+            print("releasing holds failed: \(error)")
+        }
     }
 
     /// The node's work is unknown: no new work or price until a template.
@@ -612,7 +629,7 @@ actor Sponsor {
         // checked is the room held.
         let backer: FundID? = if let funds {
             try funds.backer(
-                for: draft, fund: fund, total: total, ledger: ledger, now: now(), fundedOnly: fundedOnly
+                for: draft, fund: fund, total: total, ledger: ledger, fundedOnly: fundedOnly
             )
         } else {
             nil
@@ -620,14 +637,11 @@ actor Sponsor {
         let body = try sponsoredBody(
             draft: draft, sponsor: key.address, fee: fee, pay: pay, chainPath: chainPath
         )
-        let balance = balances[chainPath] ?? 0
-        // A signed fee shows in the balance only once mined; hold it for a
-        // few of the chain's blocks.
-        let blockTime = Int64(clamping: specs[chainPath]?.targetBlockTime ?? 0)
-        let hold = max(600_000, blockTime.multipliedReportingOverflow(by: 3).partialValue)
+        // A signed fee shows in the balance only once mined; hold it until
+        // the client's nonce passes it.
         try ledger.commit(
-            client: client, fee: total, on: chainPath, balance: balance, holdUntil: now() + hold, now: now(),
-            fund: backer
+            client: client, fee: total, on: chainPath, signer: body.signers[0], nonce: body.nonce,
+            balance: balances[chainPath] ?? 0, fund: backer
         )
         let header = try HeaderImpl(node: body)
         guard let signature = TransactionSigning.sign(bodyHeader: header, privateKeyHex: key.privateKey) else {
@@ -701,7 +715,7 @@ actor Sponsor {
     func fund(chainPath: [String], prefixes: [String]) throws -> FundResponse {
         guard let funds else { throw SponsorRefusal.noFunds }
         let id = FundID(try FundLedger.normalize(prefixes), on: chainPath)
-        let held = ledger.held(by: id, now: now())
+        let held = ledger.held(by: id)
         return FundResponse(
             deposit: funds.deposit(of: id), held: held > UInt256(UInt64.max) ? .max : UInt64(held.words[0])
         )
@@ -768,7 +782,7 @@ func refusing<Value: Sendable>(_ body: () async throws -> Value) async throws ->
         case .insufficientCredit, .notFunded: .init(code: 402, reasonPhrase: "Payment Required")
         case .notIncluded: .notFound
         case .notDeepEnough: .init(code: 425, reasonPhrase: "Too Early")
-        case .alreadyCredited: .conflict
+        case .alreadyCredited, .inFlight: .conflict
         case .servingNotCredited: .badGateway
         default: .badRequest
         }
@@ -868,6 +882,18 @@ struct SponsorRPC: Sendable {
     func relayFloor(on chainPath: [String]) async throws -> UInt64 {
         let fees: ExplorerFees = try await get("api/fees", on: chainPath)
         return fees.minRelayFee
+    }
+
+    /// The nonce `address`'s next transaction on `chainPath` must carry, as
+    /// of its tip; nil when the node reads no account (never transacted, or
+    /// no tip yet), which releases nothing.
+    func nextNonce(of address: String, on chainPath: [String]) async throws -> UInt64? {
+        do {
+            let account: ExplorerAccount = try await get("api/state/account/\(address)", on: chainPath)
+            return account.nonce
+        } catch RPCFailure.notFound {
+            return nil
+        }
     }
 
     func balance(of address: String, on chainPath: [String]) async throws -> UInt64 {

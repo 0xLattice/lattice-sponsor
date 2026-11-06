@@ -15,6 +15,7 @@
 import Foundation
 import Lattice
 import LatticeMinerCore
+import LatticeNodeAPI
 import UInt256
 
 /// What one chain's block in a template pays a share: the target a hash
@@ -142,6 +143,10 @@ public enum SponsorRefusal: Error, Sendable, Equatable {
     /// With --funded-only, no fund named pays for the transaction: it writes
     /// a key outside the fund's prefixes, or the fund is short of the fee.
     case notFunded
+    /// With --funded-only, the fund named already holds a transaction of
+    /// this signer at another nonce, which has neither landed nor been passed
+    /// by the signer's nonce: submit that one, or redraft at its nonce.
+    case inFlight
 }
 
 public struct SponsorLedger: Sendable {
@@ -168,9 +173,11 @@ public struct SponsorLedger: Sendable {
     private var submitted: Set<ShareKey> = []
     private var credits: [CreditKey: (value: UInt256, lastShare: Int64)] = [:]
     private var sold: [BlockKey: UInt256] = [:]
-    /// Fees signed and held against the balance, each tagged with the fund
-    /// whose deposit backs it, if one does.
-    private var commitments: [(chainPath: [String], fee: UInt64, until: Int64, fund: FundID?)] = []
+    /// Fees signed and held against the balance, each with the fund whose
+    /// deposit backs it, if one does, until its chain moves past it.
+    private var holds: [Hold] = []
+    /// Where `holds` are kept, if anywhere (`keepHolds(in:)`).
+    private var holdsFile: URL?
     private var lastID: UInt64 = 0
 
     private struct ShareKey: Hashable {
@@ -186,6 +193,33 @@ public struct SponsorLedger: Sendable {
     private struct BlockKey: Hashable {
         let chainPath: [String]
         let height: UInt64
+    }
+
+    /// One signed fee and pay, held until its signer's next nonce on its
+    /// chain passes `nonce`: the transaction landed, or another took its
+    /// nonce and it never can. Only the first signer's nonce is consensus,
+    /// and the client always signs first, so it is the client's nonce.
+    private struct Hold: Equatable {
+        let chainPath: [String]
+        let signer: String
+        let nonce: UInt64
+        let fee: UInt64
+        let fund: FundID?
+    }
+
+    /// A hold as `holdsFile` keeps it.
+    private struct HoldRecord: Codable {
+        let chain: String
+        let signer: String
+        @DecimalString var nonce: UInt64
+        @DecimalString var fee: UInt64
+        let fund: [String]?
+    }
+
+    /// An account whose nonce on a chain would release holds.
+    public struct Holder: Hashable, Sendable {
+        public let chainPath: [String]
+        public let signer: String
     }
 
     public init(
@@ -375,32 +409,91 @@ public struct SponsorLedger: Sendable {
     }
 
     /// Spend `fee` of `client`'s credit on `chainPath` and hold the fee
-    /// against the sponsor's `balance` there until `holdUntil`: a signed fee
-    /// not yet mined does not show in the balance. The caller signs only
-    /// after this returns. `fee` is everything the body debits the sponsor:
-    /// the fee and any payment it makes for the client. With a `fund`, the
-    /// hold also counts against that fund's deposit (see `held(by:now:)`).
+    /// against the sponsor's `balance` there until `signer`'s nonce passes
+    /// `nonce` (`release(nextNonces:)`): a signed fee not yet mined does not
+    /// show in the balance. The caller signs only after this returns. `fee`
+    /// is everything the body debits the sponsor: the fee and any payment it
+    /// makes for the client. With a `fund`, the hold also counts against that
+    /// fund's deposit (see `held(by:)`). A hold of `signer` at `nonce` under
+    /// the same fund (or none) is replaced, keeping the larger fee: only one
+    /// of the two can land.
     public mutating func commit(
-        client: String, fee: UInt64, on chainPath: [String], balance: UInt64, holdUntil: Int64, now: Int64,
+        client: String, fee: UInt64, on chainPath: [String], signer: String, nonce: UInt64, balance: UInt64,
         fund: FundID? = nil
     ) throws {
         let key = CreditKey(client: client, chainPath: chainPath)
         let cost = UInt256(fee) * Self.unit
-        guard let held = credits[key], held.value >= cost else { throw SponsorRefusal.insufficientCredit }
-        var committed = UInt256(fee)
-        for commitment in commitments where commitment.chainPath == chainPath && commitment.until > now {
-            committed = committed + UInt256(commitment.fee)
+        guard let credit = credits[key], credit.value >= cost else { throw SponsorRefusal.insufficientCredit }
+        var next = holds
+        var held = fee
+        if let replaced = next.firstIndex(where: {
+            $0.chainPath == chainPath && $0.signer == signer && $0.nonce == nonce && $0.fund == fund
+        }) {
+            held = max(fee, next.remove(at: replaced).fee)
+        }
+        let hold = Hold(chainPath: chainPath, signer: signer, nonce: nonce, fee: held, fund: fund)
+        var committed = UInt256(held)
+        for other in next where other.chainPath == chainPath {
+            committed = committed + UInt256(other.fee)
         }
         guard committed <= UInt256(balance) else { throw SponsorRefusal.insufficientFloat }
-        credits[key] = (held.value - cost, held.lastShare)
-        commitments.append((chainPath, fee, holdUntil, fund))
+        next.append(hold)
+        try save(next)
+        credits[key] = (credit.value - cost, credit.lastShare)
+        holds = next
     }
 
-    /// What `fund` backs now: its commitments not yet expired.
-    public func held(by fund: FundID, now: Int64) -> UInt256 {
-        commitments.reduce(UInt256.zero) { sum, commitment in
-            commitment.fund == fund && commitment.until > now ? sum + UInt256(commitment.fee) : sum
+    /// What `fund` backs now: its holds.
+    public func held(by fund: FundID) -> UInt256 {
+        holds.reduce(UInt256.zero) { sum, hold in hold.fund == fund ? sum + UInt256(hold.fee) : sum }
+    }
+
+    /// `signer`'s hold under `fund`, if it has one.
+    public func hold(of signer: String, under fund: FundID) -> (nonce: UInt64, fee: UInt64)? {
+        holds.first { $0.signer == signer && $0.fund == fund }.map { ($0.nonce, $0.fee) }
+    }
+
+    /// The accounts whose nonces release the holds.
+    public var holders: Set<Holder> {
+        Set(holds.map { Holder(chainPath: $0.chainPath, signer: $0.signer) })
+    }
+
+    /// Each holder's next nonce, as its chain now reads: release every hold
+    /// of theirs below it. Its transaction landed, or another took its nonce
+    /// and it never can.
+    public mutating func release(nextNonces: [Holder: UInt64]) throws {
+        let next = holds.filter { hold in
+            nextNonces[Holder(chainPath: hold.chainPath, signer: hold.signer)].map { hold.nonce >= $0 } ?? true
         }
+        guard next != holds else { return }
+        try save(next)
+        holds = next
+    }
+
+    /// Keep the holds in `file` from now on, starting from those it keeps,
+    /// if it exists: a hold signed before a restart can still land.
+    public mutating func keepHolds(in file: URL) throws {
+        if FileManager.default.fileExists(atPath: file.path) {
+            holds = try JSONDecoder().decode([HoldRecord].self, from: Data(contentsOf: file)).map { record in
+                let chainPath = record.chain.components(separatedBy: "/")
+                return Hold(
+                    chainPath: chainPath, signer: record.signer, nonce: record.nonce, fee: record.fee,
+                    fund: try record.fund.map { FundID(try FundLedger.normalize($0), on: chainPath) }
+                )
+            }
+        }
+        holdsFile = file
+    }
+
+    private func save(_ holds: [Hold]) throws {
+        guard let holdsFile else { return }
+        let records = holds.map { hold in
+            HoldRecord(
+                chain: hold.chainPath.joined(separator: "/"), signer: hold.signer, nonce: hold.nonce, fee: hold.fee,
+                fund: hold.fund?.prefixes.map { String(decoding: $0, as: UTF8.self) }
+            )
+        }
+        try JSONEncoder().encode(records).write(to: holdsFile, options: .atomic)
     }
 
     /// Drop `workIDs`' templates and the work handed out on them.
@@ -423,7 +516,6 @@ public struct SponsorLedger: Sendable {
         // the same height cannot back its reward twice.
         sold = sold.filter { key, _ in liveHeight(of: key.chainPath).map { key.height >= $0 } ?? true }
         credits = credits.filter { now - $0.value.lastShare < creditLifetime && $0.value.value > .zero }
-        commitments.removeAll { now >= $0.until }
     }
 }
 

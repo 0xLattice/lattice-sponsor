@@ -42,6 +42,7 @@ private func draft(
     signer: String,
     accountActions: [AccountAction] = [],
     actions: [Action] = [],
+    nonce: UInt64 = 0,
     chainPath: [String] = ["Nexus"]
 ) -> TransactionBody {
     TransactionBody(
@@ -51,7 +52,7 @@ private func draft(
         receiptActions: [],
         withdrawalActions: [],
         signers: [signer],
-        nonce: 0,
+        nonce: nonce,
         chainPath: chainPath
     )
 }
@@ -64,6 +65,33 @@ final class SponsorLedgerTests: XCTestCase {
         var ledger = SponsorLedger(shareTarget: target(208), rangeSize: 100)
         ledger.install(template(), now: 0)
         return ledger
+    }
+
+    /// A ledger whose client "a" has ample credit on Nexus.
+    private func fundedLedger() -> SponsorLedger {
+        var ledger = ledger()
+        let a = try! ledger.assign(client: "a", on: nexus)
+        for nonce in 0..<20 {
+            _ = try! ledger.credit(assignment: a.id, nonce: UInt64(nonce), hash: UInt256(1), now: 1)
+        }
+        return ledger
+    }
+
+    private func comment(_ signer: String, nonce: UInt64 = 0) -> TransactionBody {
+        draft(signer: signer, actions: [Action(key: "comment/1", oldValue: nil, newValue: "hi")], nonce: nonce)
+    }
+
+    private var files: [URL] = []
+
+    private func temporary(_ name: String) -> URL {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("\(name)-\(UUID().uuidString).json")
+        files.append(file)
+        return file
+    }
+
+    override func tearDown() {
+        for file in files { try? FileManager.default.removeItem(at: file) }
+        files = []
     }
 
     private let nexusShare = UInt256(1_000) << 56
@@ -143,10 +171,10 @@ final class SponsorLedgerTests: XCTestCase {
         }
         XCTAssertEqual(ledger.credit(of: "a", on: market), units(15) + marketShare)
 
-        XCTAssertThrowsError(try ledger.commit(client: "a", fee: 1, on: nexus, balance: 100, holdUntil: 600_000, now: 4)) {
+        XCTAssertThrowsError(try ledger.commit(client: "a", fee: 1, on: nexus, signer: "c", nonce: 0, balance: 100)) {
             XCTAssertEqual($0 as? SponsorRefusal, .insufficientCredit, "market credit pays no Nexus fee")
         }
-        try ledger.commit(client: "a", fee: 15, on: market, balance: 100, holdUntil: 600_000, now: 4)
+        try ledger.commit(client: "a", fee: 15, on: market, signer: "c", nonce: 0, balance: 100)
         XCTAssertEqual(ledger.credit(of: "a", on: market), marketShare)
 
         ledger.install(template(workID: "w3", marketReward: nil), now: 5)
@@ -161,62 +189,159 @@ final class SponsorLedgerTests: XCTestCase {
         for nonce in 0..<2 {
             _ = try ledger.credit(assignment: a.id, nonce: UInt64(nonce), hash: UInt256(1), now: 1)
         }
-        XCTAssertThrowsError(try ledger.commit(client: "a", fee: 8, on: nexus, balance: 100, holdUntil: 600_000, now: 2)) {
+        XCTAssertThrowsError(try ledger.commit(client: "a", fee: 8, on: nexus, signer: "c", nonce: 0, balance: 100)) {
             XCTAssertEqual($0 as? SponsorRefusal, .insufficientCredit, "two shares are 7.8 units")
         }
-        XCTAssertThrowsError(try ledger.commit(client: "a", fee: 4, on: nexus, balance: 3, holdUntil: 600_000, now: 2)) {
+        XCTAssertThrowsError(try ledger.commit(client: "a", fee: 4, on: nexus, signer: "c", nonce: 0, balance: 3)) {
             XCTAssertEqual($0 as? SponsorRefusal, .insufficientFloat)
         }
-        try ledger.commit(client: "a", fee: 4, on: nexus, balance: 7, holdUntil: 600_000, now: 2)
+        try ledger.commit(client: "a", fee: 4, on: nexus, signer: "c", nonce: 0, balance: 7)
         XCTAssertEqual(ledger.credit(of: "a", on: nexus), nexusShare * UInt256(2) - units(4))
 
         let b = try ledger.assign(client: "b", on: nexus)
         for nonce in 100..<102 {
             _ = try ledger.credit(assignment: b.id, nonce: UInt64(nonce), hash: UInt256(1), now: 3)
         }
-        XCTAssertThrowsError(try ledger.commit(client: "b", fee: 4, on: nexus, balance: 7, holdUntil: 600_000, now: 3)) {
+        XCTAssertThrowsError(try ledger.commit(client: "b", fee: 4, on: nexus, signer: "d", nonce: 0, balance: 7)) {
             XCTAssertEqual($0 as? SponsorRefusal, .insufficientFloat, "a's fee is still held")
         }
-        try ledger.commit(client: "b", fee: 4, on: nexus, balance: 8, holdUntil: 600_000, now: 3)
+        try ledger.commit(client: "b", fee: 4, on: nexus, signer: "d", nonce: 0, balance: 8)
     }
 
-    /// A fund's deposit backs holds up to its size while they last, and is
-    /// never drawn: room comes back as holds expire.
-    func testAFundBacksHoldsUpToItsDepositUntilTheyExpire() throws {
-        let file = FileManager.default.temporaryDirectory.appendingPathComponent("funds-\(UUID().uuidString).json")
-        defer { try? FileManager.default.removeItem(at: file) }
-        var funds = try FundLedger(file: file)
+    /// A fund's deposit backs holds up to its size, and is never drawn:
+    /// room comes back as the chain moves past the holds.
+    func testAFundBacksHoldsUpToItsDeposit() throws {
+        var funds = try FundLedger(file: temporary("funds"))
         let fund = FundID(["comment/"], on: nexus)
         _ = try funds.credit(fund, coins: 5)
 
-        var ledger = ledger()
-        let a = try ledger.assign(client: "a", on: nexus)
-        for nonce in 0..<2 {
-            _ = try ledger.credit(assignment: a.id, nonce: UInt64(nonce), hash: UInt256(1), now: 1)
-        }
-        let comment = draft(signer: "c", actions: [Action(key: "comment/1", oldValue: nil, newValue: "hi")])
-        func backer(_ total: UInt64, now: Int64 = 2, fundedOnly: Bool = false) throws -> FundID? {
-            try funds.backer(for: comment, fund: ["comment/"], total: total, ledger: ledger, now: now, fundedOnly: fundedOnly)
+        var ledger = fundedLedger()
+        func backer(_ signer: String, _ total: UInt64, fundedOnly: Bool = false) throws -> FundID? {
+            try funds.backer(
+                for: comment(signer), fund: ["comment/"], total: total, ledger: ledger, fundedOnly: fundedOnly
+            )
         }
 
-        let backed = try XCTUnwrap(try backer(3))
-        try ledger.commit(client: "a", fee: 3, on: nexus, balance: 100, holdUntil: 1_000, now: 2, fund: backed)
-        XCTAssertEqual(ledger.held(by: fund, now: 2), UInt256(3))
-        XCTAssertNil(try backer(3), "3 held and 3 more is over the 5 deposited")
-        XCTAssertThrowsError(try backer(3, fundedOnly: true)) { XCTAssertEqual($0 as? SponsorRefusal, .notFunded) }
-        XCTAssertEqual(try backer(2), fund, "exactly the deposit")
+        let backed = try XCTUnwrap(try backer("c", 3))
+        try ledger.commit(client: "a", fee: 3, on: nexus, signer: "c", nonce: 0, balance: 100, fund: backed)
+        XCTAssertEqual(ledger.held(by: fund), UInt256(3))
+        // The cap: what the fund holds and this total over its deposit.
+        XCTAssertNil(try backer("d", 3), "3 held and 3 more is over the 5 deposited")
+        XCTAssertThrowsError(try backer("d", 3, fundedOnly: true)) { XCTAssertEqual($0 as? SponsorRefusal, .notFunded) }
+        XCTAssertEqual(try backer("d", 2), fund, "exactly the deposit")
 
         // An unbacked hold is the operator's, not the fund's.
-        try ledger.commit(client: "a", fee: 1, on: nexus, balance: 100, holdUntil: 1_000, now: 2)
-        XCTAssertEqual(ledger.held(by: fund, now: 2), UInt256(3))
+        try ledger.commit(client: "a", fee: 1, on: nexus, signer: "c", nonce: 0, balance: 100)
+        XCTAssertEqual(ledger.held(by: fund), UInt256(3))
         // The whole key's float still bounds everything.
         XCTAssertThrowsError(
-            try ledger.commit(client: "a", fee: 2, on: nexus, balance: 5, holdUntil: 1_000, now: 2, fund: fund)
+            try ledger.commit(client: "a", fee: 2, on: nexus, signer: "d", nonce: 0, balance: 5, fund: fund)
         ) { XCTAssertEqual($0 as? SponsorRefusal, .insufficientFloat) }
-
-        XCTAssertEqual(ledger.held(by: fund, now: 1_000), .zero, "expired")
-        XCTAssertEqual(try backer(5, now: 1_000), fund)
         XCTAssertEqual(funds.deposit(of: fund), 5, "sponsoring draws nothing")
+    }
+
+    /// A hold ends when its signer's nonce passes it, however that came
+    /// about, and never with time.
+    func testAHoldIsReleasedOnlyWhenItsSignersNoncePassesIt() throws {
+        let fund = FundID(["comment/"], on: nexus)
+        var ledger = fundedLedger()
+        // c's transaction at nonce 4 lands: c's next nonce is 5. d's at
+        // nonce 2 is passed by another of d's at 2 (or 3, ...): d's next is
+        // 4. e's at 7 was dropped by the host: e's next nonce is still 7.
+        // f's chain reads no account for it at all.
+        for (signer, nonce) in [("c", 4), ("d", 2), ("e", 7), ("f", 0)] as [(String, UInt64)] {
+            try ledger.commit(client: "a", fee: 1, on: nexus, signer: signer, nonce: nonce, balance: 100, fund: fund)
+        }
+        XCTAssertEqual(ledger.held(by: fund), UInt256(4))
+        XCTAssertEqual(
+            ledger.holders, Set(["c", "d", "e", "f"].map { SponsorLedger.Holder(chainPath: nexus, signer: $0) })
+        )
+        ledger.install(template(workID: "w2", parent: "p2"), now: 100_000_000)
+        XCTAssertEqual(ledger.held(by: fund), UInt256(4), "a new tip, however late, releases nothing by itself")
+
+        try ledger.release(nextNonces: [
+            SponsorLedger.Holder(chainPath: nexus, signer: "c"): 5,
+            SponsorLedger.Holder(chainPath: nexus, signer: "d"): 4,
+            SponsorLedger.Holder(chainPath: nexus, signer: "e"): 7,
+            SponsorLedger.Holder(chainPath: market, signer: "f"): 9,
+        ])
+        XCTAssertNil(ledger.hold(of: "c", under: fund), "landed")
+        XCTAssertNil(ledger.hold(of: "d", under: fund), "passed: it can never land")
+        XCTAssertEqual(ledger.hold(of: "e", under: fund)?.nonce, 7, "dropped but not passed: it can still be resubmitted")
+        XCTAssertEqual(ledger.hold(of: "f", under: fund)?.nonce, 0, "another chain's nonce says nothing here")
+        XCTAssertEqual(ledger.held(by: fund), UInt256(2))
+    }
+
+    /// A signer holds one transaction at a time under a fund, so one that
+    /// never lands keeps at most one fee of it. A redraft at the same nonce
+    /// replaces it, since only one of the two can land.
+    func testASignerHoldsOneTransactionAtATimeUnderAFund() throws {
+        var funds = try FundLedger(file: temporary("funds"))
+        let fund = FundID(["comment/"], on: nexus)
+        _ = try funds.credit(fund, coins: 10)
+        var ledger = fundedLedger()
+        func backer(_ nonce: UInt64, _ total: UInt64, fundedOnly: Bool = false) throws -> FundID? {
+            try funds.backer(
+                for: comment("c", nonce: nonce), fund: ["comment/"], total: total, ledger: ledger,
+                fundedOnly: fundedOnly
+            )
+        }
+
+        try ledger.commit(client: "a", fee: 3, on: nexus, signer: "c", nonce: 4, balance: 100, fund: try backer(4, 3))
+        XCTAssertNil(try backer(5, 1), "another in flight: the operator's float, if anyone's")
+        XCTAssertThrowsError(try backer(5, 1, fundedOnly: true)) { XCTAssertEqual($0 as? SponsorRefusal, .inFlight) }
+        XCTAssertEqual(try backer(4, 2), fund, "a redraft at its nonce")
+        XCTAssertNil(try backer(4, 11), "a redraft still fits the deposit: 3 replaced by 11 is over the 10")
+
+        try ledger.commit(client: "a", fee: 3, on: nexus, signer: "d", nonce: 0, balance: 100, fund: fund)
+        try ledger.commit(client: "a", fee: 2, on: nexus, signer: "c", nonce: 4, balance: 100, fund: try backer(4, 2))
+        XCTAssertEqual(ledger.held(by: fund), UInt256(6), "replaced, keeping the larger fee")
+        XCTAssertEqual(ledger.hold(of: "c", under: fund)?.fee, 3)
+
+        try ledger.release(nextNonces: [SponsorLedger.Holder(chainPath: nexus, signer: "c"): 5])
+        XCTAssertEqual(try backer(5, 1, fundedOnly: true), fund, "landed: the next may go")
+    }
+
+    /// Holds kept in a file survive a restart, as deposits and claims do.
+    func testDepositsClaimsAndHoldsSurviveARestart() throws {
+        let fundsFile = temporary("funds"), paymentsFile = temporary("payments"), holdsFile = temporary("holds")
+        let fund = FundID(["comment/", "profile/"], on: market)
+        var funds = try FundLedger(file: fundsFile)
+        _ = try funds.credit(fund, coins: 9)
+        var payments = try PaymentLedger(file: paymentsFile)
+        try payments.claim("tx1")
+        try payments.release("tx1", credit: true)
+
+        var ledger = fundedLedger()
+        try ledger.keepHolds(in: holdsFile)
+        let assignment = try ledger.assign(client: "a", on: market)
+        for nonce in 0..<8 {
+            _ = try ledger.credit(assignment: assignment.id, nonce: assignment.startNonce + UInt64(nonce), hash: UInt256(1), now: 1)
+        }
+        try ledger.commit(client: "a", fee: 4, on: market, signer: "c", nonce: UInt64.max, balance: 100, fund: fund)
+        try ledger.commit(client: "a", fee: 1, on: nexus, signer: "c", nonce: 2, balance: 100)
+        try ledger.commit(client: "a", fee: 2, on: nexus, signer: "d", nonce: 0, balance: 100)
+        try ledger.release(nextNonces: [SponsorLedger.Holder(chainPath: nexus, signer: "d"): 1])
+
+        var restarted = SponsorLedger(shareTarget: target(208), rangeSize: 100)
+        try restarted.keepHolds(in: holdsFile)
+        XCTAssertEqual(restarted.held(by: fund), UInt256(4))
+        XCTAssertEqual(restarted.hold(of: "c", under: fund)?.nonce, UInt64.max)
+        XCTAssertEqual(
+            restarted.holders, Set([SponsorLedger.Holder(chainPath: market, signer: "c"), SponsorLedger.Holder(chainPath: nexus, signer: "c")])
+        )
+        XCTAssertEqual(try FundLedger(file: fundsFile).deposit(of: fund), 9)
+        XCTAssertEqual(try PaymentLedger(file: paymentsFile).credited, ["tx1"])
+        // The float still counts the operator's hold after the restart: 1
+        // held, and 100 more is over the 100.
+        restarted.install(template(), now: 0)
+        let b = try restarted.assign(client: "b", on: nexus)
+        for nonce in 0..<30 {
+            _ = try restarted.credit(assignment: b.id, nonce: UInt64(nonce), hash: UInt256(1), now: 1)
+        }
+        XCTAssertThrowsError(try restarted.commit(client: "b", fee: 100, on: nexus, signer: "e", nonce: 0, balance: 100)) {
+            XCTAssertEqual($0 as? SponsorRefusal, .insufficientFloat)
+        }
     }
 
     /// Only one block per height can be the chain's: the credit a height
