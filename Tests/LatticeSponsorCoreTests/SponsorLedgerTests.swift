@@ -512,101 +512,32 @@ final class SponsorLedgerTests: XCTestCase {
         XCTAssertNoThrow(try ledger.credit(assignment: b.id, nonce: 1, hash: UInt256(1), now: 3))
     }
 
-    // MARK: payouts (pay per share)
+    // MARK: payout work
 
-    /// A ledger where `shares` Nexus shares earn each address, with payout work.
-    private func earning(_ shares: [String: Int]) throws -> SponsorLedger {
+    func testPayoutWorkIsOwedElsewhereAndBacksAtMostHalfAHeight() throws {
         var ledger = ledger()
-        var nonce: UInt64 = 0
-        for (address, count) in shares.sorted(by: { $0.key < $1.key }) {
-            let work = try ledger.assign(client: "t-\(address)", on: nexus, payTo: address)
-            for _ in 0..<count {
-                _ = try ledger.credit(assignment: work.id, nonce: work.startNonce + nonce % 100, hash: UInt256(1), now: 1)
-                nonce += 1
+        // Nexus's block is 1,000: payout work may back 500 of it.
+        // 128 shares of 1000/256: more than one range of 100.
+        var owed = UInt256.zero
+        var work = try ledger.assign(client: "t", on: nexus, payTo: "alice")
+        var nonce = work.startNonce
+        while true {
+            if nonce == work.startNonce + work.count {
+                work = try ledger.assign(client: "t", on: nexus, payTo: "alice")
+                nonce = work.startNonce
             }
-            nonce = 0
+            do { owed = owed + (try ledger.credit(assignment: work.id, nonce: nonce, hash: UInt256(1), now: 1)) }
+            catch { XCTAssertEqual(error as? SponsorRefusal, .soldOut); break }
+            nonce += 1
         }
-        return ledger
-    }
-
-    func testPayoutWorkEarnsItsAddressNotFeeCredit() throws {
-        var ledger = try earning(["alice": 20])
-        XCTAssertEqual(ledger.earnings(of: "alice", on: nexus), nexusShare * UInt256(20))
-        XCTAssertEqual(ledger.credit(of: "t-alice", on: nexus), .zero, "the client token earns no fee credit")
-        XCTAssertThrowsError(try ledger.commit(client: "t-alice", fee: 1, on: nexus, signer: "c", nonce: 0, balance: 100)) {
-            XCTAssertEqual($0 as? SponsorRefusal, .insufficientCredit)
+        XCTAssertEqual(owed, units(500), "payout work stops at half the block")
+        XCTAssertEqual(ledger.credit(of: "t", on: nexus), .zero, "no fee credit for payout work")
+        XCTAssertThrowsError(try ledger.assign(client: "t", on: nexus, payTo: "bob")) {
+            XCTAssertEqual($0 as? SponsorRefusal, .soldOut)
         }
-        XCTAssertEqual(ledger.earnings(of: "alice", on: market), .zero, "earned on the named chain only")
-    }
-
-    func testAPayoutPaysTheWholeCoinsDueAndHoldsThemUntilItLands() throws {
-        // 20 shares are 78.125 coins; 2 are 7.8, under the threshold.
-        var ledger = try earning(["alice": 20, "bob": 2])
-        let payout = try XCTUnwrap(ledger.payout(
-            on: nexus, signer: "s", nonce: 4, fee: 1, balance: 1_000, threshold: 10, maxRecipients: 8
-        ))
-        XCTAssertEqual(payout.recipients, [.init(address: "alice", amount: 78)])
-        XCTAssertEqual(payout.total, 79, "the payout's fee is the sponsor's")
-        XCTAssertEqual(ledger.earnings(of: "alice", on: nexus), nexusShare * UInt256(20) - units(78), "the fraction stays earned")
-        XCTAssertEqual(ledger.earnings(of: "bob", on: nexus), nexusShare * UInt256(2))
-        XCTAssertTrue(ledger.paying(on: nexus, signer: "s"))
-        XCTAssertNil(try ledger.payout(on: nexus, signer: "s", nonce: 5, fee: 1, balance: 1_000, threshold: 1, maxRecipients: 8),
-                     "one payout in flight at a time")
-        // The held payout counts against the float for sponsored fees too.
-        var funded = ledger
-        let a = try funded.assign(client: "a", on: nexus)
-        for nonce in 0..<5 { _ = try funded.credit(assignment: a.id, nonce: a.startNonce + UInt64(nonce), hash: UInt256(1), now: 1) }
-        XCTAssertThrowsError(try funded.commit(client: "a", fee: 2, on: nexus, signer: "c", nonce: 0, balance: 80)) {
-            XCTAssertEqual($0 as? SponsorRefusal, .insufficientFloat)
-        }
-
-        try ledger.release(nextNonces: [SponsorLedger.Holder(chainPath: nexus, signer: "s"): 5])
-        XCTAssertFalse(ledger.paying(on: nexus, signer: "s"), "released once the sponsor's nonce passes it")
-        let next = try XCTUnwrap(ledger.payout(on: nexus, signer: "s", nonce: 5, fee: 1, balance: 1_000, threshold: 7, maxRecipients: 8))
-        XCTAssertEqual(next.recipients, [.init(address: "bob", amount: 7)])
-    }
-
-    func testAPayoutFitsTheFloatAndANotSentOneIsGivenBack() throws {
-        var ledger = try earning(["alice": 20])
-        XCTAssertNil(try ledger.payout(on: nexus, signer: "s", nonce: 0, fee: 1, balance: 60, threshold: 10, maxRecipients: 8),
-                     "78 coins don't fit a float of 60")
-        let payout = try XCTUnwrap(ledger.payout(
-            on: nexus, signer: "s", nonce: 0, fee: 1, balance: 79, threshold: 10, maxRecipients: 8
-        ))
-        try ledger.cancel(payout)
-        XCTAssertEqual(ledger.earnings(of: "alice", on: nexus), nexusShare * UInt256(20))
-        XCTAssertFalse(ledger.paying(on: nexus, signer: "s"))
-    }
-
-    func testAPayoutPaysTheLargestEarnersUpToItsRecipients() throws {
-        var ledger = try earning(["alice": 20, "bob": 10, "carol": 15])
-        let payout = try XCTUnwrap(ledger.payout(
-            on: nexus, signer: "s", nonce: 0, fee: 1, balance: 1_000, threshold: 10, maxRecipients: 2
-        ))
-        XCTAssertEqual(payout.recipients.map(\.address), ["alice", "carol"])
-        XCTAssertEqual(ledger.earnings(of: "bob", on: nexus), nexusShare * UInt256(10), "bob waits for the next payout")
-    }
-
-    func testEarningsAndAHeldPayoutSurviveARestart() throws {
-        let earningsFile = temporary("earnings"), holdsFile = temporary("holds")
-        var ledger = SponsorLedger(shareTarget: target(208), rangeSize: 100)
-        try ledger.keepHolds(in: holdsFile)
-        try ledger.keepEarnings(in: earningsFile)
-        ledger.install(template(), now: 0)
-        for (address, count) in [("alice", 20), ("bob", 3)] {
-            let work = try ledger.assign(client: "t", on: nexus, payTo: address)
-            for nonce in 0..<count { _ = try ledger.credit(assignment: work.id, nonce: work.startNonce + UInt64(nonce), hash: UInt256(1), now: 1) }
-        }
-        // bob's 3 shares are 11.7 coins, under 12: he stays earning.
-        _ = try XCTUnwrap(ledger.payout(on: nexus, signer: "s", nonce: 0, fee: 1, balance: 1_000, threshold: 12, maxRecipients: 8))
-        try ledger.saveEarnings()
-
-        var restarted = SponsorLedger(shareTarget: target(208), rangeSize: 100)
-        try restarted.keepHolds(in: holdsFile)
-        try restarted.keepEarnings(in: earningsFile)
-        XCTAssertEqual(restarted.earnings(of: "alice", on: nexus), ledger.earnings(of: "alice", on: nexus))
-        XCTAssertEqual(restarted.earnings(of: "bob", on: nexus), nexusShare * UInt256(3))
-        XCTAssertTrue(restarted.paying(on: nexus, signer: "s"), "the payout in flight is still held")
+        // Fee work still has the other half.
+        let fee = try ledger.assign(client: "a", on: nexus)
+        XCTAssertEqual(try ledger.credit(assignment: fee.id, nonce: fee.startNonce, hash: UInt256(1), now: 1), nexusShare)
     }
 
     func testSponsoredBodyAddsOnlyTheFeeAndCoSigns() throws {

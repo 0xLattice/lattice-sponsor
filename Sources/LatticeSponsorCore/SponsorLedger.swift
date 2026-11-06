@@ -12,12 +12,9 @@
 // is merged and pays the sponsor on every chain it carries; the share's worth
 // on the others, and the template's fees, are the sponsor's.
 //
-// Work can also earn coin outright: an assignment with a `payTo` address
-// credits that address's earnings instead of a client's fee credit, and the
-// sponsor pays out each address whose earnings reach its threshold, in one
-// transaction it signs alone (pay per share). The sponsor keeps the real
-// blocks the shares win, so on average the float neither grows nor shrinks
-// by it; the float bears the luck.
+// Work can also earn coin outright: an assignment with a `payTo` address is
+// valued here like any share, and its value is owed to that address
+// (`PayoutBook`), never to a client's fee credit.
 
 import Foundation
 import Lattice
@@ -184,11 +181,10 @@ public struct SponsorLedger: Sendable {
     /// Nonces already handed to the node as blocks, so a replay never is.
     private var submitted: Set<ShareKey> = []
     private var credits: [CreditKey: (value: UInt256, lastShare: Int64)] = [:]
-    /// What work has earned each payout address on each chain and not yet
-    /// been paid, scaled like credit. Kept in `earningsFile`, if set.
-    private var earnings: [CreditKey: UInt256] = [:]
-    private var earningsFile: URL?
     private var sold: [BlockKey: UInt256] = [:]
+    /// The part of `sold` that payout work took, at most half a height's
+    /// block (`payoutValue`).
+    private var soldToPayouts: [BlockKey: UInt256] = [:]
     /// Fees signed and held against the balance, each with the fund whose
     /// deposit backs it, if one does, until its chain moves past it.
     private var holds: [Hold] = []
@@ -308,7 +304,9 @@ public struct SponsorLedger: Sendable {
         // chain higher; work here could not earn until a new tip retires it.
         guard (liveHeight(of: chainPath) ?? price.height) <= price.height else { throw SponsorRefusal.busy }
         let blockValue = UInt256(price.reward) * Self.unit
-        guard sold[BlockKey(chainPath: chainPath, height: price.height)] ?? .zero < blockValue else {
+        let block = BlockKey(chainPath: chainPath, height: price.height)
+        guard sold[block] ?? .zero < blockValue else { throw SponsorRefusal.soldOut }
+        if payTo != nil, soldToPayouts[block] ?? .zero >= Self.payoutValue(of: blockValue) {
             throw SponsorRefusal.soldOut
         }
         guard assignments.count < maxAssignments else { throw SponsorRefusal.busy }
@@ -368,15 +366,19 @@ public struct SponsorLedger: Sendable {
         let block = BlockKey(chainPath: assignment.chainPath, height: assignment.height)
         let backed = sold[block] ?? .zero
         guard backed < assignment.blockValue else { throw SponsorRefusal.soldOut }
-        let value = min(assignment.shareValue, assignment.blockValue - backed)
-        sold[block] = backed + value
-        guard assignment.store == nil, assignment.peer == nil else { return value }
-        if let payTo = assignment.payTo {
-            let key = CreditKey(client: payTo, chainPath: assignment.chainPath)
-            let (sum, overflow) = (earnings[key] ?? .zero).addingReportingOverflow(value)
-            earnings[key] = overflow ? UInt256.max : sum
-            return value
+        var value = min(assignment.shareValue, assignment.blockValue - backed)
+        if assignment.payTo != nil {
+            // Payout work waits for no one; fee work has a person waiting on
+            // it. So payout work backs at most half a height's block, and the
+            // rest stays for fees.
+            let taken = soldToPayouts[block] ?? .zero, room = Self.payoutValue(of: assignment.blockValue)
+            guard taken < room else { throw SponsorRefusal.soldOut }
+            value = min(value, room - taken)
+            soldToPayouts[block] = taken + value
         }
+        sold[block] = backed + value
+        // Storage, serving and payout work: the caller owes the value elsewhere.
+        guard assignment.store == nil, assignment.peer == nil, assignment.payTo == nil else { return value }
         let key = CreditKey(client: assignment.client, chainPath: assignment.chainPath)
         let (sum, overflow) = (credits[key]?.value ?? .zero).addingReportingOverflow(value)
         credits[key] = (overflow ? UInt256.max : sum, now)
@@ -411,139 +413,14 @@ public struct SponsorLedger: Sendable {
         credits[CreditKey(client: client, chainPath: chainPath)]?.value ?? .zero
     }
 
-    /// What work has earned `address` on `chainPath` and not yet been paid,
-    /// in units scaled by 2^64.
-    public func earnings(of address: String, on chainPath: [String]) -> UInt256 {
-        earnings[CreditKey(client: address, chainPath: chainPath)] ?? .zero
+    /// The fees and pays held against the sponsor's balance on `chainPath`.
+    public func held(on chainPath: [String]) -> UInt64 {
+        holds.reduce(UInt64(0)) { $1.chainPath == chainPath ? $0 &+ $1.fee : $0 }
     }
 
-    /// The chains some address has earnings on.
-    public var earningChains: Set<[String]> {
-        Set(earnings.keys.map(\.chainPath))
-    }
-
-    /// One payout: whole coins to each address, from `signer` at `nonce`.
-    public struct Payout: Sendable, Equatable {
-        public let chainPath: [String]
-        public let signer: String
-        public let nonce: UInt64
-        public let fee: UInt64
-        public let recipients: [Recipient]
-
-        public struct Recipient: Sendable, Equatable {
-            public let address: String
-            public let amount: UInt64
-        }
-
-        /// Everything it debits the signer.
-        public var total: UInt64 { recipients.reduce(fee) { $0 + $1.amount } }
-    }
-
-    /// Take the next payout on `chainPath`: the whole coins of up to
-    /// `maxRecipients` addresses whose earnings there reach `threshold`
-    /// coins, largest first, signed by `signer` at `nonce` with `fee`. The
-    /// fraction of a coin stays earned. Nil when none is due, when one of
-    /// `signer`'s is still held there (one at a time, so a payout never waits
-    /// on a nonce another took), or when the float, less the fees and pays
-    /// already held, does not cover it. The payout is held against `balance`
-    /// like a sponsored fee until `signer`'s nonce passes `nonce`; on a send
-    /// that fails, `cancel(_:)` gives it back.
-    public mutating func payout(
-        on chainPath: [String], signer: String, nonce: UInt64, fee: UInt64, balance: UInt64,
-        threshold: UInt64, maxRecipients: Int
-    ) throws -> Payout? {
-        guard maxRecipients > 0, !holds.contains(where: { $0.chainPath == chainPath && $0.signer == signer }) else {
-            return nil
-        }
-        let held = holds.reduce(UInt256.zero) { $1.chainPath == chainPath ? $0 + UInt256($1.fee) : $0 }
-        guard UInt256(balance) > held + UInt256(fee) else { return nil }
-        var room = UInt256(balance) - held - UInt256(fee)
-        let floor = UInt256(max(threshold, 1)) * Self.unit
-        var recipients: [Payout.Recipient] = []
-        for (key, value) in earnings.filter({ $0.key.chainPath == chainPath && $0.value >= floor })
-            .sorted(by: { $0.value > $1.value || ($0.value == $1.value && $0.key.client < $1.key.client) }) {
-            guard recipients.count < maxRecipients else { break }
-            let whole = value / Self.unit
-            let amount = min(whole, UInt256(UInt64(Int64.max) / UInt64(maxRecipients + 1)))
-            guard amount <= room else { continue }
-            room = room - amount
-            recipients.append(.init(address: key.client, amount: UInt64(amount.words[0])))
-        }
-        guard !recipients.isEmpty else { return nil }
-        let payout = Payout(chainPath: chainPath, signer: signer, nonce: nonce, fee: fee, recipients: recipients)
-        let next = holds + [Hold(chainPath: chainPath, signer: signer, nonce: nonce, fee: payout.total, fund: nil)]
-        var paid = earnings
-        for recipient in recipients {
-            let key = CreditKey(client: recipient.address, chainPath: chainPath)
-            paid[key] = paid[key]! - UInt256(recipient.amount) * Self.unit
-            if paid[key] == .zero { paid[key] = nil }
-        }
-        try save(next)
-        try saveEarnings(paid)
-        holds = next
-        earnings = paid
-        return payout
-    }
-
-    /// `payout` was never sent: give its coins back to its recipients'
-    /// earnings and drop its hold.
-    public mutating func cancel(_ payout: Payout) throws {
-        var back = earnings
-        for recipient in payout.recipients {
-            let key = CreditKey(client: recipient.address, chainPath: payout.chainPath)
-            back[key] = (back[key] ?? .zero) + UInt256(recipient.amount) * Self.unit
-        }
-        let next = holds.filter {
-            !($0.chainPath == payout.chainPath && $0.signer == payout.signer && $0.nonce == payout.nonce)
-        }
-        try saveEarnings(back)
-        try save(next)
-        earnings = back
-        holds = next
-    }
-
-    /// Whether `signer` holds a payout on `chainPath` that its nonce has not
-    /// passed.
-    public func paying(on chainPath: [String], signer: String) -> Bool {
-        holds.contains { $0.chainPath == chainPath && $0.signer == signer }
-    }
-
-    /// Keep earnings in `file` from now on, starting from those it keeps, if
-    /// it exists. Earnings are written when paid out and on `saveEarnings()`;
-    /// a crash loses only what was earned since the last write.
-    public mutating func keepEarnings(in file: URL) throws {
-        if FileManager.default.fileExists(atPath: file.path) {
-            let records = try JSONDecoder().decode([EarningRecord].self, from: Data(contentsOf: file))
-            for record in records {
-                let hex = Array(record.value)
-                guard hex.count == 64 else { continue }
-                let parts = stride(from: 0, to: 64, by: 16).compactMap { UInt64(String(hex[$0..<$0 + 16]), radix: 16) }
-                guard parts.count == 4 else { continue }
-                let value = UInt256(parts)
-                earnings[CreditKey(client: record.address, chainPath: record.chain.components(separatedBy: "/"))] = value
-            }
-        }
-        earningsFile = file
-    }
-
-    /// Write the earnings to their file, if kept.
-    public func saveEarnings() throws {
-        try saveEarnings(earnings)
-    }
-
-    private struct EarningRecord: Codable {
-        let chain: String
-        let address: String
-        /// Scaled by 2^64, in hex.
-        let value: String
-    }
-
-    private func saveEarnings(_ earnings: [CreditKey: UInt256]) throws {
-        guard let earningsFile else { return }
-        let records = earnings.map {
-            EarningRecord(chain: $0.key.chainPath.joined(separator: "/"), address: $0.key.client, value: $0.value.toHexString())
-        }.sorted { ($0.chain, $0.address) < ($1.chain, $1.address) }
-        try JSONEncoder().encode(records).write(to: earningsFile, options: .atomic)
+    /// The most of a height's block value payout work may back: half.
+    public static func payoutValue(of blockValue: UInt256) -> UInt256 {
+        blockValue >> 1
     }
 
     /// What one share at `shareTarget` is worth on a chain at `price`, in
@@ -674,6 +551,7 @@ public struct SponsorLedger: Sendable {
         // chain higher: a chain missing from every template held keeps it, so
         // the same height cannot back its reward twice.
         sold = sold.filter { key, _ in liveHeight(of: key.chainPath).map { key.height >= $0 } ?? true }
+        soldToPayouts = soldToPayouts.filter { sold[$0.key] != nil }
         credits = credits.filter { now - $0.value.lastShare < creditLifetime && $0.value.value > .zero }
     }
 }

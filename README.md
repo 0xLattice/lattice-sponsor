@@ -209,23 +209,34 @@ room for more is `deposit - held`.
 
 With `--payout-at <coins>`, the sponsor is also a pay-per-share pool. A
 client asks `POST /work` with `payTo: <address>` (and no `pay`, `store` or
-`peer`); each share it hands back adds its value, at the template's price on
-the chain named, to that address's earnings there, not to a fee credit. No
-key or token is needed to earn: work only ever pays the address it names.
+`peer`); each share it hands back is owed to that address on the chain named,
+at the template's price there. No key or token is needed to earn: work only
+ever pays the address it names. `GET /earnings` reads what an address is owed.
 
-After each template, the sponsor pays every address whose earnings on a chain
-reach `--payout-at` coins: up to `--payout-recipients` (default 64) of them,
-largest first, in one transaction it signs alone, debiting its float the
-coins and the fee. Whole coins are paid; the fraction stays earned. The payout
-is held against the float, like a sponsored fee, until the sponsor's nonce on
-that chain passes it, and only one is in flight per chain: it is sent again
-with each template until it lands. A payout the node refuses is given back to
-the earnings. Earnings and held payouts are kept beside `--storage-file`
-(`lattice-sponsor-earnings.json`, `lattice-sponsor-holds.json`), written with
-each template and each payout, so a restart loses at most what was earned
-since the last template.
+After each template, the sponsor pays the addresses owed at least
+`--payout-at` coins on a chain, up to `--payout-recipients` (default 64) of
+them, largest first, whole coins (the fraction stays owed), in one
+transaction it signs alone at its next nonce there. Payout work backs at most
+half of each height's block, so fee work, which a person is waiting on, always
+has the other half.
 
-`GET /earnings` reads an address's unpaid earnings on a chain.
+A payout moves coin that must be paid once, so it is judged by the chain,
+never by what a send answered:
+
+- It is written to `lattice-sponsor-payouts.json` (beside `--storage-file`),
+  with its coins taken off what is owed, before it is first sent. A failed
+  send or a crash loses nothing: it is sent again with each template.
+- The sponsor signs nothing else as first signer, and nothing else at a
+  payout's nonce but a replacement paying the same coins to the same
+  addresses (when the node's fee floor rises past its fee). Whichever version
+  lands, each address is paid once.
+- It settles once a version is `--coin-depth` blocks deep in the canonical
+  chain. Its coins are owed again only once another transaction has held its
+  nonce that deep, which only a transaction signed elsewhere with the sponsor's
+  key can do.
+
+One payout is pending per chain, and what it can debit is kept out of the
+float sponsored fees draw on.
 
 ## What it risks
 
@@ -240,7 +251,9 @@ Payouts are the same bet without the cap per transaction: each share is paid
 at its expected value whether or not it wins, and the sponsor keeps the
 blocks it does win. On average the float neither grows nor shrinks by it; a
 run of bad luck, or shares withheld, draw it down, and a payout that no longer
-fits the float waits until it does.
+fits the float waits until it does. Don't sign transactions with the
+sponsor's key elsewhere: one that takes a pending payout's nonce delays that
+payout by `--coin-depth` blocks before its coins are owed again.
 
 A signed fee and pay are held against the float until the client's nonce
 passes them, so a body never submitted stays held. Its client paid for it in
