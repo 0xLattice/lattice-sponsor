@@ -52,11 +52,14 @@ public struct SponsorTerms: Codable, Sendable {
     /// With --funds, the account a fund's transfer pays: the sponsor's own,
     /// whose balance is the float the fund lends.
     public let fundTo: String?
+    /// With --payout-at, the coins at which work's earnings are paid out.
+    @OptionalDecimalString public var payoutAt: UInt64?
 
     public init(
         payTo: String?, depth: UInt64, storageRates: [[String]: Int], servingRates: [[String]: Int],
-        fundTo: String? = nil
+        fundTo: String? = nil, payoutAt: UInt64? = nil
     ) {
+        self.payoutAt = payoutAt
         func named(_ rates: [[String]: Int]) -> [String: Int] {
             Dictionary(uniqueKeysWithValues: rates.map { ($0.key.joined(separator: "/"), $0.value) })
         }

@@ -52,6 +52,9 @@ lattice-sponsor \
   [Paying in coin](#paying-in-coin)), with `--coin-depth`.
 - `--funds` lets a site lend the sponsor float for the transactions under
   some key prefixes (see [Funds](#funds)), with `--funded-only`.
+- `--payout-at` lets work earn coin outright: work naming a `payTo` address
+  is paid out in coin once it has earned that many (see [Payouts](#payouts)),
+  with `--payout-recipients`.
 
 Credit is held in memory, so a restart forfeits unspent shares. A chain's
 reward schedule is read once, so a chain re-hosted under the same path with a
@@ -68,14 +71,15 @@ JSON; 64-bit integers are decimal strings, and targets and work are hex.
 
 | Route | Body | Returns |
 |---|---|---|
-| `POST /work` | `{client?, chain?, pay?, store? \| peer?}` | a nonce range of the template, and the shares that buy the fee and `pay` |
-| `POST /shares` | `{assignment, nonce}` | the client's credit on its chain, and `serving` bytes for serving work |
+| `POST /work` | `{client?, chain?, pay?, store? \| peer? \| payTo?}` | a nonce range of the template, and the shares that buy the fee and `pay` |
+| `POST /shares` | `{assignment, nonce}` | the client's credit on its chain (for payout work, the address's unpaid earnings), and `serving` bytes for serving work |
 | `POST /sponsor` | `{client, transaction, pay?, fund?}` | the co-signed transaction |
 | `POST /store` | `{root, volumes: [{cid, entries?, bytes?}]}` | `{root, bytes, needed, credit, stored}` |
 | `GET /store/:root` | | `{root, bytes, needed, credit, stored}` |
 | `POST /pay` | `{chain, txCID, signer, signature, store \| peer \| fund}` | `{bytes}` bought, and a fund's `deposit` |
 | `GET /fund?chain=<path>&prefix=<p>...` | | `{deposit, held}` |
-| `GET /terms` | | `{payTo, depth, storageRates, servingRates, fundTo?}` |
+| `GET /earnings?chain=<path>&address=<a>` | | `{earned, payoutAt, paying}`, with `--payout-at` |
+| `GET /terms` | | `{payTo, depth, storageRates, servingRates, fundTo?, payoutAt?}` |
 
 With a `pay`, the sponsor credits the client `pay` within the transaction, and
 debits itself the fee plus `pay`. The client's own debits net against that
@@ -201,6 +205,42 @@ keeping the larger amount, since only one of the two can land.
 `GET /fund?chain=<path>&prefix=<p>&prefix=<q>` answers `{deposit, held}`;
 room for more is `deposit - held`.
 
+## Payouts
+
+With `--payout-at <coins>`, the sponsor is also a pay-per-share pool. A
+client asks `POST /work` with `payTo: <address>` (and no `pay`, `store` or
+`peer`); each share it hands back is owed to that address on the chain named,
+at the template's price there. No key or token is needed to earn: work only
+ever pays the address it names. `GET /earnings` reads what an address is owed.
+
+After each template, the sponsor pays the addresses owed at least
+`--payout-at` coins on a chain, up to `--payout-recipients` (default 64) of
+them, largest first, whole coins (the fraction stays owed), in one
+transaction it signs alone at its next nonce there. Payout work backs at most
+half of each height's block, so fee work, which a person is waiting on, always
+has the other half.
+
+A payout moves coin that must be paid once, so it is judged by the chain,
+never by what a send answered:
+
+- It is written to `lattice-sponsor-payouts.json` (beside `--storage-file`),
+  with its coins taken off what is owed, before it is first sent. A failed
+  send or a crash loses nothing: it is sent again with each template.
+- The sponsor signs nothing else as first signer, and nothing else at a
+  payout's nonce but a replacement paying the same coins to the same
+  addresses (when the node's fee floor rises past its fee). Whichever version
+  lands, each address is paid once.
+- It settles once a version is `--coin-depth` blocks deep in the canonical
+  chain, or once the sponsor's nonce has been past it that long even if the
+  node shows no version: the nonce moving proves one landed. That payout is
+  kept as unconfirmed and logged with a warning.
+- Its coins are never owed again on the sponsor's own judgement. If you signed
+  another transaction at that nonce with the sponsor's key elsewhere, restart
+  with `--payout-release <nonce>@<chain>` to owe them again.
+
+One payout is pending per chain, and what it can debit is kept out of the
+float sponsored fees draw on.
+
 ## What it risks
 
 A client can withhold the shares that are blocks, as against any pool, and
@@ -209,6 +249,14 @@ coins paid to the client itself: up to the fee plus `--most-pay` (by default a
 block reward) per transaction, from the key's balance, which also holds the
 blocks the sponsor wins. The float is the operator's bound on that loss; set
 `--most-pay 0` to keep it to fees.
+
+Payouts are the same bet without the cap per transaction: each share is paid
+at its expected value whether or not it wins, and the sponsor keeps the
+blocks it does win. On average the float neither grows nor shrinks by it; a
+run of bad luck, or shares withheld, draw it down, and a payout that no longer
+fits the float waits until it does. Don't sign transactions with the
+sponsor's key elsewhere: one that takes a pending payout's nonce leaves that
+payout unconfirmed and unpaid until you release it with `--payout-release`.
 
 A signed fee and pay are held against the float until the client's nonce
 passes them, so a body never submitted stays held. Its client paid for it in

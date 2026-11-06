@@ -512,6 +512,34 @@ final class SponsorLedgerTests: XCTestCase {
         XCTAssertNoThrow(try ledger.credit(assignment: b.id, nonce: 1, hash: UInt256(1), now: 3))
     }
 
+    // MARK: payout work
+
+    func testPayoutWorkIsOwedElsewhereAndBacksAtMostHalfAHeight() throws {
+        var ledger = ledger()
+        // Nexus's block is 1,000: payout work may back 500 of it.
+        // 128 shares of 1000/256: more than one range of 100.
+        var owed = UInt256.zero
+        var work = try ledger.assign(client: "t", on: nexus, payTo: "alice")
+        var nonce = work.startNonce
+        while true {
+            if nonce == work.startNonce + work.count {
+                work = try ledger.assign(client: "t", on: nexus, payTo: "alice")
+                nonce = work.startNonce
+            }
+            do { owed = owed + (try ledger.credit(assignment: work.id, nonce: nonce, hash: UInt256(1), now: 1)) }
+            catch { XCTAssertEqual(error as? SponsorRefusal, .soldOut); break }
+            nonce += 1
+        }
+        XCTAssertEqual(owed, units(500), "payout work stops at half the block")
+        XCTAssertEqual(ledger.credit(of: "t", on: nexus), .zero, "no fee credit for payout work")
+        XCTAssertThrowsError(try ledger.assign(client: "t", on: nexus, payTo: "bob")) {
+            XCTAssertEqual($0 as? SponsorRefusal, .soldOut)
+        }
+        // Fee work still has the other half.
+        let fee = try ledger.assign(client: "a", on: nexus)
+        XCTAssertEqual(try ledger.credit(assignment: fee.id, nonce: fee.startNonce, hash: UInt256(1), now: 1), nexusShare)
+    }
+
     func testSponsoredBodyAddsOnlyTheFeeAndCoSigns() throws {
         let client = CryptoUtils.generateKeyPair()
         let sponsorKey = CryptoUtils.generateKeyPair()

@@ -137,7 +137,7 @@ extension SponsorNode {
     }
 
     /// A read on `chainPath`; one the node does not have is not included.
-    private func read<Value: Decodable>(_ path: String, on chainPath: [String]) async throws -> Value {
+    func read<Value: Decodable>(_ path: String, on chainPath: [String]) async throws -> Value {
         var request = request(path)
         if chainPath != [DEFAULT_ROOT_DIRECTORY], var url = URLComponents(url: request.url!, resolvingAgainstBaseURL: false) {
             url.queryItems = [URLQueryItem(name: "chainPath", value: chainPath.joined(separator: "/"))]

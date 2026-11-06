@@ -51,15 +51,28 @@
 // sponsored. Deposits and holds are kept beside --storage-file, and deposits
 // cannot be withdrawn yet.
 //
+// With --payout-at, work naming a `payTo` address earns that address coin
+// outright (pay per share): each share's value is owed to the address on its
+// chain, and after each template the sponsor pays the addresses owed at least
+// --payout-at coins, up to --payout-recipients of them, in one transaction it
+// signs alone at its next nonce. A payout is written down before it is sent,
+// sent again with each template until one of its versions is --coin-depth
+// blocks deep, and given back only once another transaction has held its
+// nonce that deep (Payouts.swift). One is pending per chain, and what it can
+// debit is kept out of the float sponsored writes draw on. Payout work backs
+// at most half of each height's block, leaving the rest for fee work. The
+// book is kept in lattice-sponsor-payouts.json beside --storage-file.
+//
 // Routes (JSON, 64-bit integers as decimal strings, targets and work as hex):
-//   POST /work     {client?, chain?, pay?, store?|peer?} → a nonce range of the template
+//   POST /work     {client?, chain?, pay?, store?|peer?|payTo?} → a nonce range of the template
 //   POST /shares   {assignment, nonce}            → the client's credit on its chain
 //   POST /sponsor  {client, transaction, pay?, fund?} → the co-signed transaction
 //   POST /store    {root, volumes}                → the upload's status
 //   GET  /store/:root                             → {root, bytes, needed, credit, stored}
 //   POST /pay      {chain, txCID, signer, signature, store|peer|fund} → {bytes, deposit?}
 //   GET  /fund?chain=<path>&prefix=<p>...         → {deposit, held}
-//   GET  /terms                                   → {payTo, depth, storageRates, servingRates, fundTo?}
+//   GET  /earnings?chain=<path>&address=<a>       → {earned, payoutAt, paying} (with --payout-at)
+//   GET  /terms                                   → {payTo, depth, storageRates, servingRates, fundTo?, payoutAt?}
 //
 // A `pay` is coins the sponsor also credits the client in the transaction,
 // bought with the same shares as the fee, up to --most-pay (by default, the
@@ -132,6 +145,15 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
     @Option(name: .long, help: "With --pay-to or --funds: blocks built on the block carrying a transfer before it is credited.")
     var coinDepth: UInt64 = 6
 
+    @Option(name: .long, help: "Pay work naming a payTo address its earnings in coin, once they reach this many coins on a chain. Unset: no payouts.")
+    var payoutAt: UInt64?
+
+    @Option(name: .long, help: "With --payout-at: the most addresses paid in one transaction.")
+    var payoutRecipients: Int = 64
+
+    @Option(name: .long, help: "With --payout-at: <nonce>@<chain>. Owe again the coins of an unconfirmed payout (settled by its nonce, no version found) because you signed another transaction at that nonce with the sponsor's key. Repeatable; nothing else gives a payout back.")
+    var payoutRelease: [String] = []
+
     @Option(name: .long, help: "Listen address.")
     var host: String = "127.0.0.1"
 
@@ -181,7 +203,30 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
         let fundLedger = funds ? try FundLedger(file: directory.appendingPathComponent("lattice-sponsor-funds.json")) : nil
         var ledger = SponsorLedger(shareTarget: minimumWorkTarget(work))
         // A fee signed before a restart can still land, against a fund too.
-        if funds { try ledger.keepHolds(in: directory.appendingPathComponent("lattice-sponsor-holds.json")) }
+        if let payoutAt {
+            guard payoutAt > 0, payoutRecipients > 0 else {
+                throw ValidationError("--payout-at and --payout-recipients take at least 1")
+            }
+        }
+        // Payouts spend the float too: what sponsored writes hold of it must
+        // survive a restart, or a payout could spend it.
+        if funds || payoutAt != nil {
+            try ledger.keepHolds(in: directory.appendingPathComponent("lattice-sponsor-holds.json"))
+        }
+        var book = payoutAt == nil ? nil : try PayoutBook(file: directory.appendingPathComponent("lattice-sponsor-payouts.json"))
+        for release in payoutRelease {
+            let parts = release.split(separator: "@", maxSplits: 1).map(String.init)
+            guard book != nil, parts.count == 2, let nonce = UInt64(parts[0]) else {
+                throw ValidationError("--payout-release takes <nonce>@<chain>, with --payout-at")
+            }
+            guard try book!.release(on: parts[1].components(separatedBy: "/"), nonce: nonce) else {
+                throw ValidationError("no unconfirmed payout at nonce \(nonce) on \(parts[1])")
+            }
+            print("released the payout at nonce \(nonce) on \(parts[1]): its coins are owed again")
+        }
+        for payout in book?.unconfirmed ?? [] {
+            print("unconfirmed payout at nonce \(payout.nonce) on \(payout.chain): settled by its nonce, no version found")
+        }
         let sponsor = Sponsor(
             ledger: ledger,
             rpc: rpc,
@@ -196,7 +241,10 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
             coinDepth: coinDepth,
             payments: payments,
             funds: fundLedger,
-            fundedOnly: fundedOnly
+            fundedOnly: fundedOnly,
+            payoutAt: payoutAt,
+            payoutRecipients: payoutRecipients,
+            book: book
         )
         let templates = HTTPMiningCoordinatorNodeClient(
             apiBaseURL: base, cookieFile: URL(fileURLWithPath: cookieFile)
@@ -228,7 +276,7 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
             return try await refusing {
                 try await sponsor.work(
                     client: input.client, chainPath: input.chainPath, pay: input.pay ?? 0,
-                    store: input.store, peer: input.peer
+                    store: input.store, peer: input.peer, payTo: input.payTo
                 )
             }
         }
@@ -292,6 +340,17 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
             }
         }
         router.get("terms") { _, _ in await sponsor.terms() }
+        if payoutAt != nil {
+            router.get("earnings") { request, _ in
+                let query = request.uri.queryParameters
+                return try await refusing {
+                    try await sponsor.earnings(
+                        of: query.get("address") ?? "",
+                        on: (query.get("chain") ?? DEFAULT_ROOT_DIRECTORY).components(separatedBy: "/")
+                    )
+                }
+            }
+        }
         if payments != nil {
             router.post("pay") { request, context in
                 let input = try await request.decode(as: CoinPayment.self, context: context)
@@ -321,6 +380,9 @@ struct WorkRequest: Decodable {
     /// A peer's key, instead of `store`: its shares raise its serving
     /// standing on the node.
     let peer: String?
+    /// An address, instead of a fee, `store` or `peer`: its shares earn it
+    /// coin, paid out by the sponsor (with --payout-at).
+    let payTo: String?
 
     var chainPath: [String] {
         (chain ?? DEFAULT_ROOT_DIRECTORY).components(separatedBy: "/")
@@ -356,7 +418,8 @@ struct ShareRequest: Decodable {
 }
 
 struct ShareResponse: ResponseEncodable {
-    /// The client's credit on the assignment's chain, in whole units.
+    /// The client's credit on the assignment's chain, in whole units; for
+    /// payout work, the address's earnings there not yet paid.
     @DecimalString var credit: UInt64
     /// For serving work, the bytes of standing the share bought.
     @OptionalDecimalString var serving: UInt64?
@@ -404,6 +467,15 @@ struct FundResponse: ResponseEncodable {
 
 extension SponsorTerms: ResponseEncodable {}
 
+struct EarningsResponse: ResponseEncodable {
+    /// The address's earnings on the chain not yet paid out, in whole units.
+    @DecimalString var earned: UInt64
+    /// The earnings at which the sponsor pays them out.
+    @DecimalString var payoutAt: UInt64
+    /// Whether a payout to this address is in flight on the chain.
+    let paying: Bool
+}
+
 struct SponsorRequest: Decodable {
     let client: String
     /// The draft: one signer (the client), no signatures needed.
@@ -450,13 +522,25 @@ actor Sponsor {
     /// The funds, with --funds.
     private var funds: FundLedger?
     private let fundedOnly: Bool
+    /// With --payout-at: the coins at which an address's earnings are paid,
+    /// the most addresses in one payout, and each chain's payout in flight,
+    /// sent again until the sponsor's nonce passes it.
+    private let payoutAt: UInt64?
+    private let payoutRecipients: Int
+    private var book: PayoutBook?
+    /// A payout pass is running: one at a time, so a payout begins once.
+    private var payingOut = false
 
     init(
         ledger: SponsorLedger, rpc: SponsorRPC, key: SponsorKey, minimumFee: UInt64, mostPay: UInt64?,
         tokenKey: SymmetricKey, storage: StorageLedger?, serving: ServingCredit,
         pinNode: SponsorNode, payTo: String?, coinDepth: UInt64, payments: PaymentLedger?,
-        funds: FundLedger?, fundedOnly: Bool
+        funds: FundLedger?, fundedOnly: Bool, payoutAt: UInt64? = nil, payoutRecipients: Int = 64,
+        book: PayoutBook? = nil
     ) {
+        self.book = book
+        self.payoutAt = payoutAt
+        self.payoutRecipients = payoutRecipients
         self.ledger = ledger
         self.rpc = rpc
         self.key = key
@@ -515,6 +599,114 @@ actor Sponsor {
         } catch {
             print("releasing holds failed: \(error)")
         }
+        if book != nil {
+            do { try book!.save() } catch { print("saving the payout book failed: \(error)") }
+            Task { await self.payOut() }
+        }
+    }
+
+    /// One pass over the chains with a payout pending or due: settle, give
+    /// back or send again the pending one, else begin the next. Runs after
+    /// each template, never on a clock, and one pass at a time.
+    func payOut() async {
+        guard let payoutAt, let book, !payingOut else { return }
+        payingOut = true
+        defer { payingOut = false }
+        for chainPath in Set(book.pendingChains + book.dueChains(threshold: payoutAt)) {
+            do {
+                try await payOut(on: chainPath, threshold: payoutAt)
+            } catch {
+                print("payout on \(chainPath.joined(separator: "/")): \(error)")
+            }
+        }
+    }
+
+    private func payOut(on chainPath: [String], threshold: UInt64) async throws {
+        let chain = chainPath.joined(separator: "/")
+        // Unpriced (no template carries it): its fee and balance are unknown.
+        guard let fee = fees[chainPath], fee > 0, let balance = balances[chainPath] else { return }
+        let tip = try await pinNode.tipHeight(on: chainPath)
+        let nonce = try await rpc.nextNonce(of: key.address, on: chainPath) ?? 0
+        if let payout = book!.pending(on: chainPath) {
+            var deepest: (cid: String, depth: UInt64)?
+            for version in payout.versions {
+                if let depth = try await pinNode.depth(of: version.cid, on: chainPath, tipHeight: tip),
+                   depth >= deepest?.depth ?? 0 {
+                    deepest = (version.cid, depth)
+                }
+            }
+            switch try book!.observe(on: chainPath, nextNonce: nonce, tipHeight: tip, included: deepest, depth: coinDepth) {
+            case .settled(let cid):
+                print("payout \(cid) on \(chain) settled: \(payout.coins) to \(payout.recipients.count)")
+            case .settledByNonce:
+                print("WARNING: the sponsor's nonce on \(chain) passed payout nonce \(payout.nonce) \(coinDepth) blocks ago and the node shows none of its versions (\(payout.versions.map(\.cid).joined(separator: ", "))); taken as paid. If you signed another transaction at that nonce with the sponsor's key, restart with --payout-release \(payout.nonce)@\(chain) to owe its coins again.")
+            case .pending:
+                // Included and not yet deep, or its nonce taken: nothing to send.
+                guard deepest == nil, nonce <= payout.nonce else { return }
+                var latest = payout.versions.last!
+                // The node's fee floor rose past it: a replacement at the same
+                // nonce paying the same coins, which the pool takes for paying
+                // at least a floor more. Only one version can land.
+                if fee > latest.fee {
+                    let raised = latest.fee + fee
+                    let others = ledger.held(on: chainPath)
+                    if balance >= others, balance - others >= payout.coins + raised {
+                        latest = try sign(payout.recipients, fee: raised, nonce: payout.nonce, on: chainPath)
+                        try book!.replace(on: chainPath, with: latest)
+                    }
+                }
+                // A refusal (already pooled, say) proves nothing; the chain decides.
+                do { try await pinNode.submit(latest.transaction) } catch {}
+            }
+            return
+        }
+        // Nothing pending: the next payout, from the float sponsored fees
+        // don't hold.
+        let others = ledger.held(on: chainPath)
+        guard balance > others, balance - others > fee else { return }
+        let recipients = book!.due(
+            on: chainPath, threshold: threshold, maxRecipients: payoutRecipients, room: balance - others - fee
+        )
+        guard !recipients.isEmpty else { return }
+        let version = try sign(recipients, fee: fee, nonce: nonce, on: chainPath)
+        // Written down before it is sent: from here only the chain settles it.
+        try book!.begin(on: chainPath, nonce: nonce, recipients: recipients, version: version)
+        // Tests only: die between writing a payout down and sending it.
+        if ProcessInfo.processInfo.environment["LATTICE_SPONSOR_TEST_EXIT_BEFORE_SEND"] == "1" {
+            print("test: exiting with payout \(version.cid) written down and not sent")
+            exit(3)
+        }
+        let coins = recipients.reduce(UInt64(0)) { $0 + $1.amount }
+        do {
+            try await pinNode.submit(version.transaction)
+            print("paying \(coins) to \(recipients.count) on \(chain) at nonce \(nonce): \(version.cid)")
+        } catch {
+            print("payout \(version.cid) on \(chain) not taken yet (\(error)); sent again with the next template")
+        }
+    }
+
+    /// One signed version of a payout.
+    private func sign(
+        _ recipients: [PayoutBook.Recipient], fee: UInt64, nonce: UInt64, on chainPath: [String]
+    ) throws -> PayoutBook.Version {
+        let body = payoutBody(recipients: recipients, sponsor: key.address, fee: fee, nonce: nonce, chainPath: chainPath)
+        let header = try HeaderImpl(node: body)
+        guard let signature = TransactionSigning.sign(bodyHeader: header, privateKeyHex: key.privateKey) else {
+            throw HTTPError(.internalServerError, message: "signing failed")
+        }
+        let transaction = ContentBoundTransaction(signatures: [key.publicKey: signature], body: body)
+        let cid = try VolumeImpl<Transaction>(node: try transaction.transaction()).rawCID
+        return PayoutBook.Version(cid: cid, fee: fee, transaction: transaction)
+    }
+
+    func earnings(of address: String, on chainPath: [String]) throws -> EarningsResponse {
+        guard let payoutAt, let book else { throw SponsorRefusal.noPayouts }
+        guard CryptoUtils.isValidAddress(address) else { throw SponsorRefusal.draft("not an address") }
+        let units = book.earnings(of: address, on: chainPath) / SponsorLedger.unit
+        return EarningsResponse(
+            earned: units > UInt256(UInt64.max) ? .max : UInt64(units.words[0]), payoutAt: payoutAt,
+            paying: book.pending(on: chainPath)?.recipients.contains { $0.address == address } ?? false
+        )
     }
 
     /// The node's work is unknown: no new work or price until a template.
@@ -527,9 +719,20 @@ actor Sponsor {
         ledger.retire(workID: workID)
     }
 
-    func work(client: String?, chainPath: [String], pay: UInt64, store: String?, peer: String?) throws -> WorkResponse {
+    func work(
+        client: String?, chainPath: [String], pay: UInt64, store: String?, peer: String?, payTo: String? = nil
+    ) throws -> WorkResponse {
         var fee: UInt64 = 0
         var shares = UInt256.zero
+        if let payTo {
+            guard payoutAt != nil else { throw SponsorRefusal.noPayouts }
+            guard store == nil, peer == nil, pay == 0 else {
+                throw SponsorRefusal.draft("payout work pays nothing else")
+            }
+            guard CryptoUtils.isValidAddress(payTo), payTo != key.address else {
+                throw SponsorRefusal.draft("payTo is not an address")
+            }
+        }
         try ServingCredit.check(peer: peer, store: store)
         // Without --sell-storage, a store is ignored: the work is fee work.
         let store = storage == nil ? nil : store
@@ -539,7 +742,7 @@ actor Sponsor {
         } else if let store {
             guard pay == 0 else { throw SponsorRefusal.draft("storage work pays nothing else") }
             try storage!.check(root: store, on: chainPath, now: now())
-        } else {
+        } else if payTo == nil {
             fee = try currentFee(chainPath)
         }
         let total = try charge(fee: fee, pay: pay, on: chainPath)
@@ -547,8 +750,8 @@ actor Sponsor {
             guard isIssued(token) else { throw SponsorRefusal.draft("unknown client token") }
             return token
         } ?? issueToken()
-        let assignment = try ledger.assign(client: client, on: chainPath, store: store, peer: peer)
-        if store == nil, peer == nil {
+        let assignment = try ledger.assign(client: client, on: chainPath, store: store, peer: peer, payTo: payTo)
+        if store == nil, peer == nil, payTo == nil {
             shares = ledger.sharesFor(fee: total, on: chainPath) ?? .max
         }
         return WorkResponse(
@@ -581,10 +784,12 @@ actor Sponsor {
                 try storage.check(root: store, on: held.chainPath, now: now())
             }
             let value = try ledger.credit(assignment: assignment, nonce: nonce, hash: hash, now: now())
+            if let payTo = held.payTo { book?.earn(value, to: payTo, on: held.chainPath) }
             if let store = held.store {
                 try storage!.credit(root: store, value: value, on: held.chainPath, now: now())
             }
-            let units = ledger.credit(of: held.client, on: held.chainPath) / SponsorLedger.unit
+            let units = (held.payTo.map { book?.earnings(of: $0, on: held.chainPath) ?? .zero }
+                ?? ledger.credit(of: held.client, on: held.chainPath)) / SponsorLedger.unit
             return ShareResponse(
                 credit: units > UInt256(UInt64.max) ? .max : UInt64(units.words[0]),
                 serving: try held.peer.map { _ in UInt64(try serving.bytes(for: value, on: held.chainPath)) }
@@ -639,9 +844,11 @@ actor Sponsor {
         )
         // A signed fee shows in the balance only once mined; hold it until
         // the client's nonce passes it.
+        // A pending payout's coins are spoken for.
+        let balance = balances[chainPath] ?? 0, reserved = book?.reserved(on: chainPath) ?? 0
         try ledger.commit(
             client: client, fee: total, on: chainPath, signer: body.signers[0], nonce: body.nonce,
-            balance: balances[chainPath] ?? 0, fund: backer
+            balance: balance > reserved ? balance - reserved : 0, fund: backer
         )
         let header = try HeaderImpl(node: body)
         guard let signature = TransactionSigning.sign(bodyHeader: header, privateKeyHex: key.privateKey) else {
@@ -708,7 +915,7 @@ actor Sponsor {
     func terms() -> SponsorTerms {
         SponsorTerms(
             payTo: payTo, depth: coinDepth, storageRates: storage?.rates ?? [:], servingRates: serving.rates,
-            fundTo: funds == nil ? nil : key.address
+            fundTo: funds == nil ? nil : key.address, payoutAt: payoutAt
         )
     }
 
@@ -779,6 +986,7 @@ func refusing<Value: Sendable>(_ body: () async throws -> Value) async throws ->
     } catch let refusal as SponsorRefusal {
         let status: HTTPResponse.Status = switch refusal {
         case .busy, .unpriceable, .insufficientFloat, .soldOut: .serviceUnavailable
+        case .noPayouts: .notFound
         case .insufficientCredit, .notFunded: .init(code: 402, reasonPhrase: "Payment Required")
         case .notIncluded: .notFound
         case .notDeepEnough: .init(code: 425, reasonPhrase: "Too Early")

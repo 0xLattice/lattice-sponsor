@@ -11,6 +11,10 @@
 // chain its client named: the client earns on that chain alone. The template
 // is merged and pays the sponsor on every chain it carries; the share's worth
 // on the others, and the template's fees, are the sponsor's.
+//
+// Work can also earn coin outright: an assignment with a `payTo` address is
+// valued here like any share, and its value is owed to that address
+// (`PayoutBook`), never to a client's fee credit.
 
 import Foundation
 import Lattice
@@ -87,6 +91,9 @@ public struct ShareAssignment: Sendable, Equatable {
     public let store: String?
     /// The peer whose standing its shares raise, when they pay for serving.
     public let peer: String?
+    /// The address its shares earn coin for, paid out by the sponsor, when
+    /// they are neither fee credit nor storage nor serving.
+    public var payTo: String? = nil
 }
 
 public enum SponsorRefusal: Error, Sendable, Equatable {
@@ -147,6 +154,8 @@ public enum SponsorRefusal: Error, Sendable, Equatable {
     /// this signer at another nonce, which has neither landed nor been passed
     /// by the signer's nonce: submit that one, or redraft at its nonce.
     case inFlight
+    /// The sponsor pays out no earnings (it runs without --payout-at).
+    case noPayouts
 }
 
 public struct SponsorLedger: Sendable {
@@ -173,6 +182,9 @@ public struct SponsorLedger: Sendable {
     private var submitted: Set<ShareKey> = []
     private var credits: [CreditKey: (value: UInt256, lastShare: Int64)] = [:]
     private var sold: [BlockKey: UInt256] = [:]
+    /// The part of `sold` that payout work took, at most half a height's
+    /// block (`payoutValue`).
+    private var soldToPayouts: [BlockKey: UInt256] = [:]
     /// Fees signed and held against the balance, each with the fund whose
     /// deposit backs it, if one does, until its chain moves past it.
     private var holds: [Hold] = []
@@ -280,8 +292,9 @@ public struct SponsorLedger: Sendable {
     /// credited on `chainPath` at this template's price: as fee credit, or
     /// with a `store`, to that upload, or with a `peer`, to its standing.
     public mutating func assign(
-        client: String, on chainPath: [String], store: String? = nil, peer: String? = nil
+        client: String, on chainPath: [String], store: String? = nil, peer: String? = nil, payTo: String? = nil
     ) throws -> ShareAssignment {
+        precondition(payTo == nil || (store == nil && peer == nil))
         guard let template = latest,
               let price = template.prices[chainPath],
               let value = Self.shareValue(shareTarget: shareTarget, at: price), value > .zero else {
@@ -291,7 +304,9 @@ public struct SponsorLedger: Sendable {
         // chain higher; work here could not earn until a new tip retires it.
         guard (liveHeight(of: chainPath) ?? price.height) <= price.height else { throw SponsorRefusal.busy }
         let blockValue = UInt256(price.reward) * Self.unit
-        guard sold[BlockKey(chainPath: chainPath, height: price.height)] ?? .zero < blockValue else {
+        let block = BlockKey(chainPath: chainPath, height: price.height)
+        guard sold[block] ?? .zero < blockValue else { throw SponsorRefusal.soldOut }
+        if payTo != nil, soldToPayouts[block] ?? .zero >= Self.payoutValue(of: blockValue) {
             throw SponsorRefusal.soldOut
         }
         guard assignments.count < maxAssignments else { throw SponsorRefusal.busy }
@@ -313,7 +328,8 @@ public struct SponsorLedger: Sendable {
             startNonce: start,
             count: rangeSize,
             store: store,
-            peer: peer
+            peer: peer,
+            payTo: payTo
         )
         assignments[assignment.id] = assignment
         return assignment
@@ -350,9 +366,19 @@ public struct SponsorLedger: Sendable {
         let block = BlockKey(chainPath: assignment.chainPath, height: assignment.height)
         let backed = sold[block] ?? .zero
         guard backed < assignment.blockValue else { throw SponsorRefusal.soldOut }
-        let value = min(assignment.shareValue, assignment.blockValue - backed)
+        var value = min(assignment.shareValue, assignment.blockValue - backed)
+        if assignment.payTo != nil {
+            // Payout work waits for no one; fee work has a person waiting on
+            // it. So payout work backs at most half a height's block, and the
+            // rest stays for fees.
+            let taken = soldToPayouts[block] ?? .zero, room = Self.payoutValue(of: assignment.blockValue)
+            guard taken < room else { throw SponsorRefusal.soldOut }
+            value = min(value, room - taken)
+            soldToPayouts[block] = taken + value
+        }
         sold[block] = backed + value
-        guard assignment.store == nil, assignment.peer == nil else { return value }
+        // Storage, serving and payout work: the caller owes the value elsewhere.
+        guard assignment.store == nil, assignment.peer == nil, assignment.payTo == nil else { return value }
         let key = CreditKey(client: assignment.client, chainPath: assignment.chainPath)
         let (sum, overflow) = (credits[key]?.value ?? .zero).addingReportingOverflow(value)
         credits[key] = (overflow ? UInt256.max : sum, now)
@@ -385,6 +411,16 @@ public struct SponsorLedger: Sendable {
     /// `client`'s credit on `chainPath`, in units scaled by 2^64.
     public func credit(of client: String, on chainPath: [String]) -> UInt256 {
         credits[CreditKey(client: client, chainPath: chainPath)]?.value ?? .zero
+    }
+
+    /// The fees and pays held against the sponsor's balance on `chainPath`.
+    public func held(on chainPath: [String]) -> UInt64 {
+        holds.reduce(UInt64(0)) { $1.chainPath == chainPath ? $0 &+ $1.fee : $0 }
+    }
+
+    /// The most of a height's block value payout work may back: half.
+    public static func payoutValue(of blockValue: UInt256) -> UInt256 {
+        blockValue >> 1
     }
 
     /// What one share at `shareTarget` is worth on a chain at `price`, in
@@ -515,6 +551,7 @@ public struct SponsorLedger: Sendable {
         // chain higher: a chain missing from every template held keeps it, so
         // the same height cannot back its reward twice.
         sold = sold.filter { key, _ in liveHeight(of: key.chainPath).map { key.height >= $0 } ?? true }
+        soldToPayouts = soldToPayouts.filter { sold[$0.key] != nil }
         credits = credits.filter { now - $0.value.lastShare < creditLifetime && $0.value.value > .zero }
     }
 }
