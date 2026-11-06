@@ -231,9 +231,12 @@ never by what a send answered:
   addresses (when the node's fee floor rises past its fee). Whichever version
   lands, each address is paid once.
 - It settles once a version is `--coin-depth` blocks deep in the canonical
-  chain. Its coins are owed again only once another transaction has held its
-  nonce that deep, which only a transaction signed elsewhere with the sponsor's
-  key can do.
+  chain, or once the sponsor's nonce has been past it that long even if the
+  node shows no version: the nonce moving proves one landed. That payout is
+  kept as unconfirmed and logged with a warning.
+- Its coins are never owed again on the sponsor's own judgement. If you signed
+  another transaction at that nonce with the sponsor's key elsewhere, restart
+  with `--payout-release <nonce>@<chain>` to owe them again.
 
 One payout is pending per chain, and what it can debit is kept out of the
 float sponsored fees draw on.
@@ -252,8 +255,8 @@ at its expected value whether or not it wins, and the sponsor keeps the
 blocks it does win. On average the float neither grows nor shrinks by it; a
 run of bad luck, or shares withheld, draw it down, and a payout that no longer
 fits the float waits until it does. Don't sign transactions with the
-sponsor's key elsewhere: one that takes a pending payout's nonce delays that
-payout by `--coin-depth` blocks before its coins are owed again.
+sponsor's key elsewhere: one that takes a pending payout's nonce leaves that
+payout unconfirmed and unpaid until you release it with `--payout-release`.
 
 A signed fee and pay are held against the float until the client's nonce
 passes them, so a body never submitted stays held. Its client paid for it in

@@ -151,6 +151,9 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
     @Option(name: .long, help: "With --payout-at: the most addresses paid in one transaction.")
     var payoutRecipients: Int = 64
 
+    @Option(name: .long, help: "With --payout-at: <nonce>@<chain>. Owe again the coins of an unconfirmed payout (settled by its nonce, no version found) because you signed another transaction at that nonce with the sponsor's key. Repeatable; nothing else gives a payout back.")
+    var payoutRelease: [String] = []
+
     @Option(name: .long, help: "Listen address.")
     var host: String = "127.0.0.1"
 
@@ -205,8 +208,25 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
                 throw ValidationError("--payout-at and --payout-recipients take at least 1")
             }
         }
-        if funds { try ledger.keepHolds(in: directory.appendingPathComponent("lattice-sponsor-holds.json")) }
-        let book = payoutAt == nil ? nil : try PayoutBook(file: directory.appendingPathComponent("lattice-sponsor-payouts.json"))
+        // Payouts spend the float too: what sponsored writes hold of it must
+        // survive a restart, or a payout could spend it.
+        if funds || payoutAt != nil {
+            try ledger.keepHolds(in: directory.appendingPathComponent("lattice-sponsor-holds.json"))
+        }
+        var book = payoutAt == nil ? nil : try PayoutBook(file: directory.appendingPathComponent("lattice-sponsor-payouts.json"))
+        for release in payoutRelease {
+            let parts = release.split(separator: "@", maxSplits: 1).map(String.init)
+            guard book != nil, parts.count == 2, let nonce = UInt64(parts[0]) else {
+                throw ValidationError("--payout-release takes <nonce>@<chain>, with --payout-at")
+            }
+            guard try book!.release(on: parts[1].components(separatedBy: "/"), nonce: nonce) else {
+                throw ValidationError("no unconfirmed payout at nonce \(nonce) on \(parts[1])")
+            }
+            print("released the payout at nonce \(nonce) on \(parts[1]): its coins are owed again")
+        }
+        for payout in book?.unconfirmed ?? [] {
+            print("unconfirmed payout at nonce \(payout.nonce) on \(payout.chain): settled by its nonce, no version found")
+        }
         let sponsor = Sponsor(
             ledger: ledger,
             rpc: rpc,
@@ -452,7 +472,7 @@ struct EarningsResponse: ResponseEncodable {
     @DecimalString var earned: UInt64
     /// The earnings at which the sponsor pays them out.
     @DecimalString var payoutAt: UInt64
-    /// Whether a payout of the sponsor's is in flight on the chain.
+    /// Whether a payout to this address is in flight on the chain.
     let paying: Bool
 }
 
@@ -618,8 +638,8 @@ actor Sponsor {
             switch try book!.observe(on: chainPath, nextNonce: nonce, tipHeight: tip, included: deepest, depth: coinDepth) {
             case .settled(let cid):
                 print("payout \(cid) on \(chain) settled: \(payout.coins) to \(payout.recipients.count)")
-            case .givenBack:
-                print("payout at nonce \(payout.nonce) on \(chain) can't land (another transaction took its nonce); its coins are owed again")
+            case .settledByNonce:
+                print("WARNING: the sponsor's nonce on \(chain) passed payout nonce \(payout.nonce) \(coinDepth) blocks ago and the node shows none of its versions (\(payout.versions.map(\.cid).joined(separator: ", "))); taken as paid. If you signed another transaction at that nonce with the sponsor's key, restart with --payout-release \(payout.nonce)@\(chain) to owe its coins again.")
             case .pending:
                 // Included and not yet deep, or its nonce taken: nothing to send.
                 guard deepest == nil, nonce <= payout.nonce else { return }
@@ -651,6 +671,11 @@ actor Sponsor {
         let version = try sign(recipients, fee: fee, nonce: nonce, on: chainPath)
         // Written down before it is sent: from here only the chain settles it.
         try book!.begin(on: chainPath, nonce: nonce, recipients: recipients, version: version)
+        // Tests only: die between writing a payout down and sending it.
+        if ProcessInfo.processInfo.environment["LATTICE_SPONSOR_TEST_EXIT_BEFORE_SEND"] == "1" {
+            print("test: exiting with payout \(version.cid) written down and not sent")
+            exit(3)
+        }
         let coins = recipients.reduce(UInt64(0)) { $0 + $1.amount }
         do {
             try await pinNode.submit(version.transaction)
@@ -680,7 +705,7 @@ actor Sponsor {
         let units = book.earnings(of: address, on: chainPath) / SponsorLedger.unit
         return EarningsResponse(
             earned: units > UInt256(UInt64.max) ? .max : UInt64(units.words[0]), payoutAt: payoutAt,
-            paying: book.pending(on: chainPath) != nil
+            paying: book.pending(on: chainPath)?.recipients.contains { $0.address == address } ?? false
         )
     }
 

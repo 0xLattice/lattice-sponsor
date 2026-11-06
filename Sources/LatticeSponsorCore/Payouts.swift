@@ -15,10 +15,14 @@
 //   nothing: the payout is still pending and is sent again.
 // - It is settled once one of its versions is `depth` blocks deep in the
 //   canonical chain (`observe`).
-// - Its coins go back to the earnings only once no version can ever land:
-//   the sponsor's nonce has passed N with none of them included, and stayed
-//   so for `depth` blocks, so another transaction holds N for good. Only a
-//   transaction the operator signed with the sponsor's key can do that.
+// - Or once the sponsor's nonce has been past N for `depth` blocks with no
+//   version found: the nonce moving proves a version landed, since nothing
+//   else is signed at N. The node failing to show it (a read it couldn't
+//   make) is no evidence it didn't. Such a payout is kept as unconfirmed.
+// - Its coins are never owed again on the book's own judgement. Only a
+//   transaction signed elsewhere with the sponsor's key could take N, and
+//   only the operator knows of one: `release` gives an unconfirmed payout's
+//   coins back on their word (--payout-release).
 //
 // One payout is pending per chain at a time. What it pays, at its largest
 // fee, is reserved against the sponsor's float (`reserved`).
@@ -77,18 +81,23 @@ public struct PayoutBook: Sendable {
         case pending
         /// A version is deep in the chain: the recipients are paid.
         case settled(cid: String)
-        /// No version can land: its coins are owed again.
-        case givenBack
+        /// The nonce has long passed and no version was found: paid, as far
+        /// as the chain can say. Kept in `unconfirmed`.
+        case settledByNonce
     }
 
     private struct Stored: Codable {
         var earnings: [String: [String: String]] = [:]
         var pending: [Pending] = []
+        var unconfirmed: [Pending]? = nil
     }
 
     /// Each chain's earnings by address, scaled by 2^64 (`SponsorLedger.unit`).
     private var earnings: [[String]: [String: UInt256]] = [:]
     private var pending: [[String]: Pending] = [:]
+    /// Payouts settled by their nonce alone, no version found: the record
+    /// an operator's `release` works from.
+    public private(set) var unconfirmed: [Pending] = []
     private let file: URL?
     /// Earnings changed since the file was last written.
     public private(set) var dirty = false
@@ -102,6 +111,7 @@ public struct PayoutBook: Sendable {
             earnings[chain.components(separatedBy: "/")] = owed.compactMapValues(Self.parse)
         }
         for payout in stored.pending { pending[payout.chainPath] = payout }
+        unconfirmed = stored.unconfirmed ?? []
     }
 
     // MARK: earning
@@ -197,9 +207,9 @@ public struct PayoutBook: Sendable {
 
     /// Check the pending payout on `chainPath` against the chain: the
     /// sponsor's next nonce and the tip height, and the depth of the deepest
-    /// version included in the canonical chain (nil: none is). A payout
-    /// settles at `depth`, and is given back only after its nonce has been
-    /// taken by another transaction for `depth` blocks.
+    /// version included in the canonical chain (nil: none was found). A
+    /// payout settles once a version is `depth` deep, or once its nonce has
+    /// been passed for `depth` blocks with none found. Never given back here.
     public mutating func observe(
         on chainPath: [String], nextNonce: UInt64, tipHeight: UInt64, included: (cid: String, depth: UInt64)?, depth: UInt64
     ) throws -> Outcome {
@@ -212,11 +222,10 @@ public struct PayoutBook: Sendable {
         } else if included == nil, nextNonce > payout.nonce {
             let since = payout.passedAt ?? tipHeight
             if tipHeight >= since + depth {
-                for recipient in payout.recipients {
-                    next.earn(Self.coins(recipient.amount), to: recipient.address, on: chainPath)
-                }
+                payout.passedAt = since
+                next.unconfirmed.append(payout)
                 next.pending[chainPath] = nil
-                outcome = .givenBack
+                outcome = .settledByNonce
             } else {
                 guard payout.passedAt == nil else { return .pending }
                 payout.passedAt = since
@@ -236,6 +245,24 @@ public struct PayoutBook: Sendable {
         return outcome
     }
 
+    /// Give the coins of the unconfirmed payout at `nonce` on `chainPath`
+    /// back to what is owed: the operator knows another transaction, signed
+    /// elsewhere with the sponsor's key, took its nonce. False when there is
+    /// no such payout.
+    public mutating func release(on chainPath: [String], nonce: UInt64) throws -> Bool {
+        guard let index = unconfirmed.firstIndex(where: { $0.chainPath == chainPath && $0.nonce == nonce }) else {
+            return false
+        }
+        var next = self
+        let payout = next.unconfirmed.remove(at: index)
+        for recipient in payout.recipients {
+            next.earn(Self.coins(recipient.amount), to: recipient.address, on: chainPath)
+        }
+        try next.write()
+        self = next
+        return true
+    }
+
     /// Write the book if earnings changed since it was last written.
     public mutating func save() throws {
         guard dirty else { return }
@@ -250,6 +277,7 @@ public struct PayoutBook: Sendable {
             stored.earnings[chain.joined(separator: "/")] = owed.mapValues { $0.toHexString() }
         }
         stored.pending = pending.values.sorted { $0.chain < $1.chain }
+        stored.unconfirmed = unconfirmed.isEmpty ? nil : unconfirmed
         let encoder = JSONEncoder()
         encoder.outputFormatting = .sortedKeys
         do {

@@ -87,15 +87,34 @@ final class PayoutBookTests: XCTestCase {
         XCTAssertEqual(book.earnings(of: "alice", on: chain), half, "paid: not owed again")
     }
 
-    func testCoinsGoBackOnlyOnceAnotherTransactionHasHeldTheNonceDeep() throws {
-        var book = try book()
+    /// The nonce passing proves a version landed even when the node can't
+    /// show one: settled, never owed again on the book's own judgement.
+    func testAPassedNonceWithNoVersionFoundSettlesAndOwesNothingAgain() throws {
+        let file = temporary()
+        var book = try book(file)
         try book.begin(on: chain, nonce: 4, recipients: [.init(address: "alice", amount: 78)], version: payoutVersion("v1"))
-        // The nonce passed with no version included: someone else's transaction, maybe only for now.
         XCTAssertEqual(try book.observe(on: chain, nextNonce: 5, tipHeight: 200, included: nil, depth: 6), .pending)
         XCTAssertEqual(try book.observe(on: chain, nextNonce: 5, tipHeight: 205, included: nil, depth: 6), .pending)
-        XCTAssertEqual(try book.observe(on: chain, nextNonce: 5, tipHeight: 206, included: nil, depth: 6), .givenBack)
+        XCTAssertEqual(try book.observe(on: chain, nextNonce: 5, tipHeight: 206, included: nil, depth: 6), .settledByNonce)
         XCTAssertNil(book.pending(on: chain))
-        XCTAssertEqual(book.earnings(of: "alice", on: chain), coins(78) + half, "owed again, once")
+        XCTAssertEqual(book.earnings(of: "alice", on: chain), half, "not owed again: it may well have been paid")
+        XCTAssertEqual(try PayoutBook(file: file).unconfirmed.map(\.nonce), [4], "kept for the operator")
+    }
+
+    /// Only the operator, who knows they signed another transaction at the
+    /// nonce, gives an unconfirmed payout's coins back, and only once.
+    func testTheOperatorReleasesAnUnconfirmedPayoutOnce() throws {
+        let file = temporary()
+        var book = try book(file)
+        try book.begin(on: chain, nonce: 4, recipients: [.init(address: "alice", amount: 78)], version: payoutVersion("v1"))
+        _ = try book.observe(on: chain, nextNonce: 5, tipHeight: 200, included: nil, depth: 6)
+        _ = try book.observe(on: chain, nextNonce: 5, tipHeight: 206, included: nil, depth: 6)
+        var restarted = try PayoutBook(file: file)
+        XCTAssertFalse(try restarted.release(on: chain, nonce: 3))
+        XCTAssertTrue(try restarted.release(on: chain, nonce: 4))
+        XCTAssertEqual(restarted.earnings(of: "alice", on: chain), coins(78) + half)
+        XCTAssertFalse(try restarted.release(on: chain, nonce: 4), "once")
+        XCTAssertEqual(try PayoutBook(file: file).unconfirmed.count, 0)
     }
 
     func testAReorgThatUndoesThePassStartsTheCountAgain() throws {
@@ -106,7 +125,7 @@ final class PayoutBookTests: XCTestCase {
                        "the nonce is free again")
         XCTAssertEqual(try book.observe(on: chain, nextNonce: 5, tipHeight: 206, included: nil, depth: 6), .pending,
                        "counted from the new pass, not the first")
-        XCTAssertEqual(try book.observe(on: chain, nextNonce: 5, tipHeight: 212, included: nil, depth: 6), .givenBack)
+        XCTAssertEqual(try book.observe(on: chain, nextNonce: 5, tipHeight: 212, included: nil, depth: 6), .settledByNonce)
     }
 
     func testAReplacementKeepsTheRecipientsAndReservesItsLargerFee() throws {
