@@ -52,6 +52,9 @@ lattice-sponsor \
   [Paying in coin](#paying-in-coin)), with `--coin-depth`.
 - `--funds` lets a site lend the sponsor float for the transactions under
   some key prefixes (see [Funds](#funds)), with `--funded-only`.
+- `--payout-at` lets work earn coin outright: work naming a `payTo` address
+  is paid out in coin once it has earned that many (see [Payouts](#payouts)),
+  with `--payout-recipients`.
 
 Credit is held in memory, so a restart forfeits unspent shares. A chain's
 reward schedule is read once, so a chain re-hosted under the same path with a
@@ -68,14 +71,15 @@ JSON; 64-bit integers are decimal strings, and targets and work are hex.
 
 | Route | Body | Returns |
 |---|---|---|
-| `POST /work` | `{client?, chain?, pay?, store? \| peer?}` | a nonce range of the template, and the shares that buy the fee and `pay` |
-| `POST /shares` | `{assignment, nonce}` | the client's credit on its chain, and `serving` bytes for serving work |
+| `POST /work` | `{client?, chain?, pay?, store? \| peer? \| payTo?}` | a nonce range of the template, and the shares that buy the fee and `pay` |
+| `POST /shares` | `{assignment, nonce}` | the client's credit on its chain (for payout work, the address's unpaid earnings), and `serving` bytes for serving work |
 | `POST /sponsor` | `{client, transaction, pay?, fund?}` | the co-signed transaction |
 | `POST /store` | `{root, volumes: [{cid, entries?, bytes?}]}` | `{root, bytes, needed, credit, stored}` |
 | `GET /store/:root` | | `{root, bytes, needed, credit, stored}` |
 | `POST /pay` | `{chain, txCID, signer, signature, store \| peer \| fund}` | `{bytes}` bought, and a fund's `deposit` |
 | `GET /fund?chain=<path>&prefix=<p>...` | | `{deposit, held}` |
-| `GET /terms` | | `{payTo, depth, storageRates, servingRates, fundTo?}` |
+| `GET /earnings?chain=<path>&address=<a>` | | `{earned, payoutAt, paying}`, with `--payout-at` |
+| `GET /terms` | | `{payTo, depth, storageRates, servingRates, fundTo?, payoutAt?}` |
 
 With a `pay`, the sponsor credits the client `pay` within the transaction, and
 debits itself the fee plus `pay`. The client's own debits net against that
@@ -201,6 +205,28 @@ keeping the larger amount, since only one of the two can land.
 `GET /fund?chain=<path>&prefix=<p>&prefix=<q>` answers `{deposit, held}`;
 room for more is `deposit - held`.
 
+## Payouts
+
+With `--payout-at <coins>`, the sponsor is also a pay-per-share pool. A
+client asks `POST /work` with `payTo: <address>` (and no `pay`, `store` or
+`peer`); each share it hands back adds its value, at the template's price on
+the chain named, to that address's earnings there, not to a fee credit. No
+key or token is needed to earn: work only ever pays the address it names.
+
+After each template, the sponsor pays every address whose earnings on a chain
+reach `--payout-at` coins: up to `--payout-recipients` (default 64) of them,
+largest first, in one transaction it signs alone, debiting its float the
+coins and the fee. Whole coins are paid; the fraction stays earned. The payout
+is held against the float, like a sponsored fee, until the sponsor's nonce on
+that chain passes it, and only one is in flight per chain: it is sent again
+with each template until it lands. A payout the node refuses is given back to
+the earnings. Earnings and held payouts are kept beside `--storage-file`
+(`lattice-sponsor-earnings.json`, `lattice-sponsor-holds.json`), written with
+each template and each payout, so a restart loses at most what was earned
+since the last template.
+
+`GET /earnings` reads an address's unpaid earnings on a chain.
+
 ## What it risks
 
 A client can withhold the shares that are blocks, as against any pool, and
@@ -209,6 +235,12 @@ coins paid to the client itself: up to the fee plus `--most-pay` (by default a
 block reward) per transaction, from the key's balance, which also holds the
 blocks the sponsor wins. The float is the operator's bound on that loss; set
 `--most-pay 0` to keep it to fees.
+
+Payouts are the same bet without the cap per transaction: each share is paid
+at its expected value whether or not it wins, and the sponsor keeps the
+blocks it does win. On average the float neither grows nor shrinks by it; a
+run of bad luck, or shares withheld, draw it down, and a payout that no longer
+fits the float waits until it does.
 
 A signed fee and pay are held against the float until the client's nonce
 passes them, so a body never submitted stays held. Its client paid for it in
