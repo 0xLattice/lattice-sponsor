@@ -59,7 +59,7 @@ final class FundsTests: XCTestCase {
         let ledger = SponsorLedger(shareTarget: UInt256(1))
 
         XCTAssertEqual(
-            try funds.backer(for: body(["comment/1"]), fund: ["comment/", "comment/"], total: 10, ledger: ledger, now: 0, fundedOnly: true),
+            try funds.backer(for: body(["comment/1"]), fund: ["comment/", "comment/"], total: 10, ledger: ledger, fundedOnly: true),
             FundID(fund, on: site), "covered, and fits the deposit"
         )
         for (draft, named, total) in [
@@ -71,11 +71,11 @@ final class FundsTests: XCTestCase {
             (body(["comment/1"], chainPath: ["Nexus"]), fund, 1),
             (body(["comment/1"]), fund, 11),
         ] as [(TransactionBody, [String]?, UInt64)] {
-            XCTAssertThrowsError(try funds.backer(for: draft, fund: named, total: total, ledger: ledger, now: 0, fundedOnly: true)) {
+            XCTAssertThrowsError(try funds.backer(for: draft, fund: named, total: total, ledger: ledger, fundedOnly: true)) {
                 XCTAssertEqual($0 as? SponsorRefusal, .notFunded)
             }
             XCTAssertNil(
-                try funds.backer(for: draft, fund: named, total: total, ledger: ledger, now: 0, fundedOnly: false),
+                try funds.backer(for: draft, fund: named, total: total, ledger: ledger, fundedOnly: false),
                 "held against the operator's float, as before"
             )
         }

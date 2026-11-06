@@ -98,7 +98,7 @@ final class StorageCreditTests: XCTestCase {
             try storage.credit(root: root, value: value, on: market, now: 1)
         }
         XCTAssertEqual(ledger.credit(of: "a", on: market), .zero, "storage work is not fee credit")
-        XCTAssertThrowsError(try ledger.commit(client: "a", fee: 1, on: market, balance: 100, holdUntil: 600_000, now: 2)) {
+        XCTAssertThrowsError(try ledger.commit(client: "a", fee: 1, on: market, signer: "c", nonce: 0, balance: 100)) {
             XCTAssertEqual($0 as? SponsorRefusal, .insufficientCredit)
         }
     }

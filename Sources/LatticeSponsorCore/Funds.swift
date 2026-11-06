@@ -3,7 +3,9 @@
 // own account, under a fund named by key prefixes. A sponsored transaction
 // that names the fund and writes only keys under its prefixes is held against
 // the fund's deposit instead of the operator's own float: the fund's fees
-// signed and not yet expired stay within its deposit. Nothing is drawn from
+// signed and not yet landed or passed stay within its deposit. A signer has
+// one hold at a time on a fund, so one reader whose transaction never lands
+// keeps at most one fee of the deposit. Nothing is drawn from
 // a deposit. Clients still buy every fee with work, which repays it through
 // the template's rewards to the sponsor's key, so on average a deposit stays
 // the payer's. Anyone may fund any prefixes. Deposits are kept in one JSON
@@ -87,17 +89,28 @@ public struct FundLedger: Sendable {
     /// The fund that holds `total` (the fee and any `pay`) for sponsoring
     /// `draft`, or nil to hold it against the operator's own float:
     /// `fundedOnly` refuses a draft no fund backs. A fund backs a draft it
-    /// covers while its unexpired holds and `total` fit in its deposit.
+    /// covers while its holds and `total` fit in its deposit, and its signer
+    /// holds nothing under it at another nonce: a hold lasts until the
+    /// signer's nonce passes it, so one in flight per signer bounds what a
+    /// transaction never submitted keeps. One at the same nonce is replaced
+    /// (`SponsorLedger.commit`), so a draft that cannot land can be redrafted.
     public func backer(
         for draft: TransactionBody, fund: [String]?, total: UInt64,
-        ledger: SponsorLedger, now: Int64, fundedOnly: Bool
+        ledger: SponsorLedger, fundedOnly: Bool
     ) throws -> FundID? {
         if let fund {
             let prefixes = try Self.normalize(fund)
             let id = FundID(prefixes, on: draft.chainPath)
-            if Self.covers(draft, prefixes: prefixes),
-               ledger.held(by: id, now: now) + UInt256(total) <= UInt256(deposit(of: id)) {
-                return id
+            if Self.covers(draft, prefixes: prefixes), let signer = draft.signers.first {
+                let mine = ledger.hold(of: signer, under: id)
+                if let mine, mine.nonce != draft.nonce {
+                    guard !fundedOnly else { throw SponsorRefusal.inFlight }
+                    return nil
+                }
+                let replaced = mine?.fee ?? 0
+                if ledger.held(by: id) - UInt256(replaced) + UInt256(max(total, replaced)) <= UInt256(deposit(of: id)) {
+                    return id
+                }
             }
         }
         guard !fundedOnly else { throw SponsorRefusal.notFunded }
