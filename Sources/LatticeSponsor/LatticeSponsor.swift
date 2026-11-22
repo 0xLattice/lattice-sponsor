@@ -72,7 +72,7 @@
 //   POST /pay      {chain, txCID, signer, signature, store|peer|fund} → {bytes, deposit?}
 //   GET  /fund?chain=<path>&prefix=<p>...         → {deposit, held}
 //   GET  /earnings?chain=<path>&address=<a>       → {earned, payoutAt, paying} (with --payout-at)
-//   GET  /terms                                   → {payTo, depth, storageRates, servingRates, fundTo?, payoutAt?}
+//   GET  /terms                                   → {address, payTo, depth, storageRates, servingRates, fundTo?, payoutAt?}
 //
 // A `pay` is coins the sponsor also credits the client in the transaction,
 // bought with the same shares as the fee, up to --most-pay (by default, the
@@ -139,7 +139,7 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
     @Flag(name: .long, help: "With --funds: sponsor only transactions a named fund's deposit backs.")
     var fundedOnly = false
 
-    @Option(name: .long, help: "With --sell-storage or --serving-rate: the account a transfer pays to buy storage or serving in coin, at their rates. Unset: no coin is taken.")
+    @Option(name: .long, help: "The account a transfer pays to buy storage or serving in coin, at their rates (with --sell-storage or --serving-rate), published as payTo in /terms. Unset: no coin is taken.")
     var payTo: String?
 
     @Option(name: .long, help: "With --pay-to or --funds: blocks built on the block carrying a transfer before it is credited.")
@@ -192,10 +192,9 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
         let node = SponsorNode(base: base, authorization: { rpcCookieAuthorization(file: cookie) })
         guard !fundedOnly || funds else { throw ValidationError("--funded-only requires --funds") }
         let directory = URL(fileURLWithPath: storageFile).deletingLastPathComponent()
+        // Alone, --pay-to only publishes the address in /terms: a claim on
+        // /pay is refused before it is spent, with no rate to price it.
         if let payTo {
-            guard sellStorage || !serving.rates.isEmpty else {
-                throw ValidationError("--pay-to requires --sell-storage or --serving-rate")
-            }
             guard CryptoUtils.isValidAddress(payTo) else { throw ValidationError("--pay-to is not an address") }
         }
         let payments = payTo != nil || funds
@@ -912,8 +911,8 @@ actor Sponsor {
 
     func terms() -> SponsorTerms {
         SponsorTerms(
-            payTo: payTo, depth: coinDepth, storageRates: storage?.rates ?? [:], servingRates: serving.rates,
-            fundTo: funds == nil ? nil : key.address, payoutAt: payoutAt
+            address: key.address, payTo: payTo, depth: coinDepth, storageRates: storage?.rates ?? [:],
+            servingRates: serving.rates, funds: funds != nil, payoutAt: payoutAt
         )
     }
 

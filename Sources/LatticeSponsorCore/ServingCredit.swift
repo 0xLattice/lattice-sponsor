@@ -44,6 +44,8 @@ public struct ServingCredit: Sendable {
 
 /// `GET /terms`.
 public struct SponsorTerms: Codable, Sendable {
+    /// The sponsor's own account: its key's address, always.
+    public let address: String
     public let payTo: String?
     @DecimalString public var depth: UInt64
     /// Bytes per coin, by chain path.
@@ -56,9 +58,10 @@ public struct SponsorTerms: Codable, Sendable {
     @OptionalDecimalString public var payoutAt: UInt64?
 
     public init(
-        payTo: String?, depth: UInt64, storageRates: [[String]: Int], servingRates: [[String]: Int],
-        fundTo: String? = nil, payoutAt: UInt64? = nil
+        address: String, payTo: String?, depth: UInt64, storageRates: [[String]: Int],
+        servingRates: [[String]: Int], funds: Bool = false, payoutAt: UInt64? = nil
     ) {
+        self.address = address
         self.payoutAt = payoutAt
         func named(_ rates: [[String]: Int]) -> [String: Int] {
             Dictionary(uniqueKeysWithValues: rates.map { ($0.key.joined(separator: "/"), $0.value) })
@@ -67,7 +70,7 @@ public struct SponsorTerms: Codable, Sendable {
         self.depth = depth
         self.storageRates = named(storageRates)
         self.servingRates = named(servingRates)
-        self.fundTo = fundTo
+        self.fundTo = funds ? address : nil
     }
 }
 
