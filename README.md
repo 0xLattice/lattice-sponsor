@@ -156,15 +156,20 @@ the node's own operator routes, sent the same way:
 `Authorization: Basic <base64 of the --cookie-file's content>` (otherwise
 401). The sponsor then:
 
-- blocks the CID, and the root of every upload naming it, for good, in
-  `lattice-sponsor-blocklist.json` beside `--storage-file`. An upload naming a
-  blocked CID as its root or a Volume is refused (`blocked`, 451) on
-  `POST /store`, and so is work or coin for it on `POST /work`,
-  `POST /shares` and `POST /pay`. `POST /sponsor` pins nothing;
-- unpins, with the node's `DELETE /pins/:cid`, the CID and every Volume of
-  the pinned uploads naming it that no other pinned upload keeps, so the node
-  releases them as it does any unpinned Volume; and drops any upload naming it
-  not yet pinned (one being pinned is unpinned once it is);
+- blocks the CID, and the root and every Volume of each upload naming it,
+  pinned or not, for good, in `lattice-sponsor-blocklist.json` beside
+  `--storage-file` (mode 0600). An upload naming a blocked CID as its root or
+  a Volume is refused (`blocked`, 451) on `POST /store`, and so is work or
+  coin for it on `POST /work`, `POST /shares` and `POST /pay`, so a new
+  manifest listing the same chunks cannot pin them again. A Volume the
+  taken-down file shares with an innocuous one is blocked too: a later upload
+  of that other file is refused, though one already pinned keeps it.
+  `POST /sponsor` pins nothing;
+- unpins, with the node's `DELETE /pins/:cid`, every Volume of the pinned
+  uploads naming it that no other upload, pinned or being pinned, keeps, so
+  the node releases them as it does any unpinned Volume. It unpins only
+  Volumes of its own uploads, never a pin it did not make. It drops any upload
+  naming the CID not yet pinned (one being pinned is unpinned once it is);
 - returns their bytes to `--storage-budget`.
 
 It answers the Volumes it unpinned. If the node refuses an unpin, the CID is

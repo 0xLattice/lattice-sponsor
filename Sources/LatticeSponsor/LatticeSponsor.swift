@@ -340,12 +340,8 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
                 }
                 return status
             }
-            router.post("takedown") { request, context in
-                try requireOperator(request, cookie: cookie)
-                let input = try await request.decode(as: TakedownRequest.self, context: context)
-                return try await sponsor.takedown(input.cid)
-            }
         }
+        addOperatorRoutes(to: router, sponsor: sponsor, cookie: cookie)
         router.get("terms") { _, _ in await sponsor.terms() }
         if payoutAt != nil {
             router.get("earnings") { request, _ in
@@ -1063,6 +1059,16 @@ func refusing<Value: Sendable>(_ body: () async throws -> Value) async throws ->
         default: break
         }
         throw HTTPError(status, headers: headers, message: "\(refusal)")
+    }
+}
+
+/// `POST /takedown`, for the operator alone; refused (404) without
+/// --sell-storage.
+func addOperatorRoutes(to router: Router<BasicRequestContext>, sponsor: Sponsor, cookie: URL) {
+    router.post("takedown") { request, context in
+        try requireOperator(request, cookie: cookie)
+        let input = try await request.decode(as: TakedownRequest.self, context: context)
+        return try await sponsor.takedown(input.cid)
     }
 }
 

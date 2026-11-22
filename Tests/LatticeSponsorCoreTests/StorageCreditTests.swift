@@ -235,7 +235,7 @@ final class StorageCreditTests: XCTestCase {
         var storage = try storage()
         _ = try storage.upload(root: "root", volumes: volumes, now: 0)
         try pay(2, to: "root", &storage)
-        XCTAssertEqual(try storage.block("root"), ["root"], "nothing of it is pinned but the CID itself")
+        XCTAssertEqual(try storage.block("root"), [], "nothing of it is pinned")
         XCTAssertThrowsError(try storage.credit(root: "root", value: SponsorLedger.unit, on: market, now: 1)) {
             XCTAssertEqual($0 as? SponsorRefusal, .blocked, "its paid bytes are not refunded")
         }
@@ -266,5 +266,43 @@ final class StorageCreditTests: XCTestCase {
             XCTAssertEqual($0 as? SponsorRefusal, .overBudget, "25 pinned and 5 held of 30")
         }
         XCTAssertEqual(storage.use(now: 3_600_000).held, 0, "an unpaid upload's hold ends with it")
+    }
+
+    func testATakedownBlocksEveryVolumeSoANewManifestCannotRepinThem() async throws {
+        var storage = try storage()
+        let fake = FakeNode(served: ["other": ["other": bytes(10)]])
+        try await store("root", volumes, in: &storage, on: fake)
+        try await fake.node.unpin(try storage.block("root"))
+        try storage.release("root")
+        let manifest = [StoreVolume(cid: "R2", entries: ["R2": bytes(5)]), StoreVolume(cid: "other", bytes: 10)]
+        XCTAssertThrowsError(try storage.upload(root: "R2", volumes: manifest, now: 0)) {
+            XCTAssertEqual($0 as? SponsorRefusal, .blocked, "R's chunk is blocked under any manifest")
+        }
+    }
+
+    func testATakedownKeepsAVolumeAnUploadBeingPinnedShares() async throws {
+        var storage = try storage()
+        let fake = FakeNode(served: ["other": ["other": bytes(10)]])
+        try await store("root", volumes, in: &storage, on: fake)
+        let b = [StoreVolume(cid: "b", entries: ["b": bytes(5)]), StoreVolume(cid: "other", bytes: 10)]
+        _ = try storage.upload(root: "b", volumes: b, now: 0)
+        try pay(3, to: "b", &storage)
+        let pinning = try XCTUnwrap(storage.takePaid("b"))
+
+        XCTAssertEqual(try storage.block("root"), ["root"], "b, being pinned, keeps other")
+        XCTAssertEqual(storage.unreferenced(["root", "other", "b"]), [], "root stays counted until released")
+        try storage.release("root")
+        XCTAssertEqual(storage.unreferenced(["root", "other", "b"]), ["root"])
+        try await fake.node.pin(pinning)
+        XCTAssertTrue(try storage.finish("b", pinned: true))
+        XCTAssertEqual(storage.status(of: "b")?.stored, true)
+    }
+
+    func testTheBlocklistIsTheOperatorsAlone() throws {
+        var storage = try storage()
+        _ = try storage.block("root")
+        let blocklist = file.deletingLastPathComponent().appendingPathComponent("lattice-sponsor-blocklist.json")
+        let mode = try FileManager.default.attributesOfItem(atPath: blocklist.path)[.posixPermissions] as? NSNumber
+        XCTAssertEqual(mode?.intValue, 0o600)
     }
 }

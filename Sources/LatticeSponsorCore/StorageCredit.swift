@@ -223,24 +223,27 @@ public struct StorageLedger: Sendable {
         return true
     }
 
-    /// Take `cid` down: block it for good, with the root of every upload
-    /// naming it as its root or a Volume, and drop those not yet pinned.
-    /// Answers the Volumes to unpin on the node: `cid` itself, and every
-    /// Volume of each pinned upload naming it that no other pinned upload
-    /// keeps. The pinned uploads stay counted until `release`, so a takedown
-    /// whose unpinning fails is simply asked again.
+    /// Take `cid` down: block it for good, with the root and every Volume
+    /// of each upload naming it as its root or a Volume, pinned or not, so
+    /// no other upload listing those Volumes pins them again; and drop those
+    /// not yet pinned. Answers the Volumes to unpin on the node: those of
+    /// each pinned upload naming it that no other upload keeps, pinned or
+    /// being pinned. Only Volumes of the sponsor's own uploads are ever
+    /// unpinned. The pinned uploads stay counted until `release`, so a
+    /// takedown whose unpinning fails is simply asked again.
     public mutating func block(_ cid: String) throws -> [String] {
-        let dropped = pending.filter { $0.key == cid || $0.value.volumes.contains { $0.cid == cid } }.keys
+        let dropped = pending.filter { $0.key == cid || $0.value.volumes.contains { $0.cid == cid } }
         let roots = Set(volumes.filter { $0.key == cid || $0.value.contains(cid) }.keys)
-        let blocking = roots.union(dropped).union([cid])
+        let blocking = Set(roots.flatMap { volumes[$0]! })
+            .union(dropped.values.flatMap { $0.volumes.map(\.cid) })
+            .union(roots).union(dropped.keys).union([cid])
         if !blocking.isSubset(of: blocked) {
             blocked.formUnion(blocking)
-            try JSONEncoder().encode(blocked.sorted()).write(to: blocklistFile, options: .atomic)
+            try saveBlocklist()
         }
-        for root in dropped { pending[root] = nil }
-        let kept = Set(volumes.filter { !roots.contains($0.key) }.values.joined())
-        let released = Set(roots.flatMap { volumes[$0]! }).subtracting(kept).union([cid])
-        return released.sorted()
+        for root in dropped.keys { pending[root] = nil }
+        let kept = keptVolumes(excluding: roots)
+        return Set(roots.flatMap { volumes[$0]! }).subtracting(kept).sorted()
     }
 
     /// Forget the pinned uploads naming the blocked `cid`, once their
@@ -255,10 +258,23 @@ public struct StorageLedger: Sendable {
         try save()
     }
 
-    /// Of `cids`, those no pinned upload keeps.
+    /// Of `cids`, those no upload keeps, pinned or being pinned.
     public func unreferenced(_ cids: [String]) -> [String] {
-        let kept = Set(volumes.values.joined())
+        let kept = keptVolumes(excluding: [])
         return cids.filter { !kept.contains($0) }
+    }
+
+    /// The Volumes of the pinned uploads but `roots`, and of the uploads
+    /// being pinned.
+    private func keptVolumes(excluding roots: Set<String>) -> Set<String> {
+        Set(volumes.filter { !roots.contains($0.key) }.values.joined())
+            .union(pending.values.filter(\.pinning).flatMap { $0.volumes.map(\.cid) })
+    }
+
+    /// The blocklist, readable by the operator alone.
+    private func saveBlocklist() throws {
+        try JSONEncoder().encode(blocked.sorted()).write(to: blocklistFile, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: blocklistFile.path)
     }
 
     private func save() throws {
