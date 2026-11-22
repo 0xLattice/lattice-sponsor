@@ -109,7 +109,11 @@ final class TakedownRouteTests: XCTestCase {
             fake.refusing = false
             try await client.execute(uri: "/takedown", method: .post, headers: Self.operatorHeaders, body: Self.body) {
                 XCTAssertEqual($0.status, .ok)
-                XCTAssertEqual(String(buffer: $0.body), #"{"cid":"root","unpinned":["leaf","root"]}"#)
+                struct Answer: Decodable, Equatable { let cid: String; let unpinned: [String] }
+                XCTAssertEqual(
+                    try JSONDecoder().decode(Answer.self, from: Data(buffer: $0.body)),
+                    Answer(cid: "root", unpinned: ["leaf", "root"])
+                )
             }
         }
         XCTAssertEqual(fake.pins, ["mine"], "a pin the sponsor did not make is left alone")
