@@ -86,6 +86,30 @@ debits itself the fee plus `pay`. The client's own debits net against that
 credit, so a purchase of exactly `pay` draws nothing from the client's
 balance.
 
+### Refusals
+
+A refusal is JSON, `{"error":{"message":"<name>"}}`, and carries
+`Access-Control-Allow-Origin: *` like every answer, so a web page can read it.
+Clients match on the name; the status groups them. Two are routine on
+`/shares`, and both mean the same thing to a client: the work is spent, so ask
+`POST /work` again with the same `client` token (its credit is kept) and grind
+the new range.
+
+- `unknownAssignment` (400): the sponsor no longer holds the assignment.
+  Work on every earlier template is dropped when a block lands on the tip
+  (and when the sponsor reconnects to its node or restarts), so every worker
+  sees this about once per block.
+- `expired` (400): the assignment's template is still held, but the chain
+  the shares are credited on has moved past the block it carries, so its
+  shares can no longer win it.
+
+Three refusals carry `Retry-After` in seconds, exposed to pages
+(`Access-Control-Expose-Headers`): `busy` and `soldOut` (503) and
+`notDeepEnough` (425). Each clears as the chain moves, so the value is a hint:
+no clock predicts when it does. `unpriceable` and `insufficientFloat` (503)
+carry none: they may never clear (a chain whose emission has ended, a sponsor
+with no float).
+
 ## Storage
 
 A storage sponsor keeps files forever, for proof of work that mines real
