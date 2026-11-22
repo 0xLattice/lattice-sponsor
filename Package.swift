@@ -54,6 +54,14 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]),
         .testTarget(
+            name: "LatticeSponsorTests",
+            dependencies: [
+                "LatticeSponsor",
+                "LatticeSponsorCore",
+                .product(name: "Hummingbird", package: "hummingbird"),
+                .product(name: "HummingbirdTesting", package: "hummingbird"),
+            ]),
+        .testTarget(
             name: "LatticeSponsorCoreTests",
             dependencies: [
                 "LatticeSponsorCore",
