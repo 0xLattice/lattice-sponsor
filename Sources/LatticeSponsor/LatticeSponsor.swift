@@ -30,8 +30,12 @@
 //
 // With --sell-storage, work naming an upload's root as `store` pays for it at
 // --storage-rate bytes per coin; once paid, every Volume is pinned on the
-// node for good. Unpaid uploads are held in memory for an hour, paid ones until
-// pinned, and a restart forfeits them; the roots pinned are kept in --storage-file.
+// node, within --storage-budget bytes. Unpaid uploads are held in memory for
+// an hour, paid ones until pinned, and a restart forfeits them; the roots
+// pinned are kept in --storage-file.
+// The operator takes a CID down with POST /takedown (the node's RPC cookie as
+// its credential): its uploads' Volumes are unpinned, nothing paid for them is
+// refunded, and the CID is blocked for good, in a file beside --storage-file.
 //
 // With --pay-to, a transfer to that account, --coin-depth blocks deep, buys
 // the same storage at the same rates, claimed once by one of its signers on
@@ -72,7 +76,8 @@
 //   POST /pay      {chain, txCID, signer, signature, store|peer|fund} → {bytes, deposit?}
 //   GET  /fund?chain=<path>&prefix=<p>...         → {deposit, held}
 //   GET  /earnings?chain=<path>&address=<a>       → {earned, payoutAt, paying} (with --payout-at)
-//   GET  /terms                                   → {address, payTo, depth, storageRates, servingRates, fundTo?, payoutAt?}
+//   GET  /terms                                   → {address, payTo, depth, storageRates, servingRates, fundTo?, payoutAt?, storage?}
+//   POST /takedown {cid}                          → {cid, unpinned} (operator only)
 //
 // A `pay` is coins the sponsor also credits the client in the transaction,
 // bought with the same shares as the fee, up to --most-pay (by default, the
@@ -118,10 +123,10 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
     @Option(name: .long, help: "The most coins to pay a client within one transaction, for its shares (default: the chain's block reward; 0: fees only).")
     var mostPay: UInt64?
 
-    @Flag(name: .long, help: "Sell storage: work naming an upload's root pins its Volumes on the node for good.")
+    @Flag(name: .long, help: "Sell storage: work naming an upload's root pins its Volumes on the node until the operator takes it down.")
     var sellStorage = false
 
-    @Option(name: .long, help: "With --sell-storage: the most bytes ever pinned.")
+    @Option(name: .long, help: "With --sell-storage: the most bytes pinned at once, uploads not yet pinned included; a takedown frees its bytes.")
     var storageBudget: Int = 1 << 30
 
     @Option(name: .long, help: "With --sell-storage: a chain whose work pays for storage, and the bytes one unit of it buys, as chain-path=bytesPerCoin, e.g. Nexus=1024 (repeatable).")
@@ -335,6 +340,11 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
                 }
                 return status
             }
+            router.post("takedown") { request, context in
+                try requireOperator(request, cookie: cookie)
+                let input = try await request.decode(as: TakedownRequest.self, context: context)
+                return try await sponsor.takedown(input.cid)
+            }
         }
         router.get("terms") { _, _ in await sponsor.terms() }
         if payoutAt != nil {
@@ -444,6 +454,17 @@ struct StoreResponse: ResponseEncodable {
         credit = UInt64(status.credit)
         stored = status.stored
     }
+}
+
+struct TakedownRequest: Decodable {
+    /// An upload's root, or one of its Volumes.
+    let cid: String
+}
+
+struct TakedownResponse: ResponseEncodable {
+    let cid: String
+    /// The Volumes unpinned on the node.
+    let unpinned: [String]
 }
 
 struct PayResponse: ResponseEncodable {
@@ -817,10 +838,37 @@ actor Sponsor {
             print("pinning \(root) failed: \(error)")
         }
         do {
-            try storage?.finish(root, pinned: pinned)
+            if try storage?.finish(root, pinned: pinned) == false {
+                // Taken down while it was being pinned.
+                try await pinNode.unpin(storage!.unreferenced(upload.volumes.map(\.cid)))
+                print("unpinned \(root): taken down while it was pinned")
+            } else if pinned {
+                print("pinned \(root): \(upload.bytes) bytes in \(upload.volumes.count) Volumes")
+            }
         } catch {
             print("recording \(root) as stored failed: \(error)")
         }
+    }
+
+    /// Take `cid` down: block it, unpin the Volumes of the uploads naming
+    /// it, and return their bytes to the budget. What was paid for them is
+    /// not refunded.
+    func takedown(_ cid: String) async throws -> TakedownResponse {
+        guard storage != nil else { throw HTTPError(.notFound) }
+        guard !cid.isEmpty, cid.utf8.count <= 256,
+              cid.unicodeScalars.allSatisfy({ $0.isASCII && CharacterSet.alphanumerics.contains($0) }) else {
+            throw HTTPError(.badRequest, message: "not a CID")
+        }
+        let volumes = try storage!.block(cid)
+        do {
+            try await pinNode.unpin(volumes)
+        } catch {
+            print("takedown of \(cid): blocked, unpinning failed (\(error)); ask again")
+            throw HTTPError(.badGateway, message: "notUnpinned")
+        }
+        try storage!.release(cid)
+        print("took down \(cid): blocked, unpinned \(volumes.joined(separator: " "))")
+        return TakedownResponse(cid: cid, unpinned: volumes)
     }
 
     func sponsor(client: String, draft: TransactionBody, pay: UInt64, fund: [String]?) throws -> SponsorResponse {
@@ -912,7 +960,7 @@ actor Sponsor {
     func terms() -> SponsorTerms {
         SponsorTerms(
             address: key.address, payTo: payTo, depth: coinDepth, storageRates: storage?.rates ?? [:],
-            servingRates: serving.rates, funds: funds != nil, payoutAt: payoutAt
+            servingRates: serving.rates, funds: funds != nil, payoutAt: payoutAt, storage: storage?.use(now: now())
         )
     }
 
@@ -999,6 +1047,7 @@ func refusing<Value: Sendable>(_ body: () async throws -> Value) async throws ->
         case .noPayouts: .notFound
         case .insufficientCredit, .notFunded: .init(code: 402, reasonPhrase: "Payment Required")
         case .notIncluded: .notFound
+        case .blocked: .init(code: 451, reasonPhrase: "Unavailable For Legal Reasons")
         case .notDeepEnough: .init(code: 425, reasonPhrase: "Too Early")
         case .alreadyCredited, .inFlight: .conflict
         case .servingNotCredited: .badGateway
@@ -1014,6 +1063,17 @@ func refusing<Value: Sendable>(_ body: () async throws -> Value) async throws ->
         default: break
         }
         throw HTTPError(status, headers: headers, message: "\(refusal)")
+    }
+}
+
+/// The operator's routes take the node's RPC cookie as their credential, as
+/// the node's own do: `Authorization: Basic <base64 of the cookie file>`,
+/// read fresh each time since the node writes a new one at every start.
+func requireOperator(_ request: Request, cookie: URL) throws {
+    guard let expected = rpcCookieAuthorization(file: cookie),
+          let given = request.headers[.authorization],
+          SHA256.hash(data: Data(given.utf8)) == SHA256.hash(data: Data(expected.utf8)) else {
+        throw HTTPError(.unauthorized, message: "operator only")
     }
 }
 

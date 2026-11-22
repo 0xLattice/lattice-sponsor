@@ -44,6 +44,12 @@ private final class FakeNode: @unchecked Sendable {
             lock.unlock()
             return respond(200, Data(#"{"pins":[]}"#.utf8))
         }
+        if request.httpMethod == "DELETE", url.path.hasPrefix("/pins/") {
+            lock.lock()
+            defer { lock.unlock() }
+            guard _pins.removeValue(forKey: url.lastPathComponent) != nil else { return respond(404) }
+            return respond(200, Data(#"{"pins":[]}"#.utf8))
+        }
         if url.path.hasPrefix("/fetch/"), let entries = served[url.lastPathComponent] {
             return respond(200, try JSONEncoder().encode(Pin(cid: url.lastPathComponent, entries: entries)))
         }
@@ -57,12 +63,15 @@ private func bytes(_ count: Int) -> String { Data(repeating: 7, count: count).ba
 final class StorageCreditTests: XCTestCase {
     private var file: URL!
 
-    override func setUp() {
-        file = FileManager.default.temporaryDirectory.appendingPathComponent("storage-\(UUID().uuidString).json")
+    /// Each test's own directory: the blocklist is kept beside the file.
+    override func setUpWithError() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("storage-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        file = directory.appendingPathComponent("storage.json")
     }
 
     override func tearDown() {
-        try? FileManager.default.removeItem(at: file)
+        try? FileManager.default.removeItem(at: file.deletingLastPathComponent())
     }
 
     /// A share on Market is 10/16 of a coin (as in `SponsorLedgerTests`); at
@@ -174,5 +183,88 @@ final class StorageCreditTests: XCTestCase {
         XCTAssertEqual(try storage.upload(root: "chunk", volumes: chunk, now: 0).bytes, (1 << 20) + 12)
         let over = [StoreVolume(cid: "over", entries: ["over": bytes(StorageLedger.largestVolume + 1)])]
         XCTAssertThrowsError(try storage.upload(root: "over", volumes: over, now: 0))
+    }
+
+    /// Upload, pay and pin `volumes` under `root` on `fake`.
+    private func store(
+        _ root: String, _ volumes: [StoreVolume], in storage: inout StorageLedger, on fake: FakeNode
+    ) async throws {
+        _ = try storage.upload(root: root, volumes: volumes, now: 0)
+        try pay(3, to: root, &storage)
+        try await fake.node.pin(try XCTUnwrap(storage.takePaid(root)))
+        try storage.finish(root, pinned: true)
+    }
+
+    func testATakedownUnpinsTheUploadAndFreesItsBytes() async throws {
+        var storage = try storage(budget: 40)
+        let fake = FakeNode(served: ["other": ["other": bytes(10)]])
+        try await store("root", volumes, in: &storage, on: fake)
+        XCTAssertEqual(storage.use(now: 0), StorageUse(budget: 40, stored: 25, held: 0))
+
+        let released = try storage.block("root")
+        XCTAssertEqual(released, ["other", "root"])
+        try await fake.node.unpin(released)
+        try storage.release("root")
+
+        XCTAssertEqual(fake.pins, [:], "every Volume is released on the node")
+        XCTAssertNil(storage.status(of: "root"))
+        XCTAssertEqual(storage.use(now: 0), StorageUse(budget: 40, stored: 0, held: 0))
+    }
+
+    func testATakenDownCIDCannotBePinnedAgainEvenAfterARestart() async throws {
+        var storage = try storage()
+        let fake = FakeNode(served: ["other": ["other": bytes(10)]])
+        try await store("root", volumes, in: &storage, on: fake)
+        // Named by one Volume: the upload holding it goes with it.
+        try await fake.node.unpin(try storage.block("other"))
+        try storage.release("other")
+        XCTAssertEqual(fake.pins, [:])
+
+        var restarted = try self.storage()
+        for (root, upload) in [("root", volumes), ("again", [StoreVolume(cid: "again", bytes: 5), StoreVolume(cid: "other", bytes: 10)])] {
+            XCTAssertThrowsError(try restarted.upload(root: root, volumes: upload, now: 0)) {
+                XCTAssertEqual($0 as? SponsorRefusal, .blocked, root)
+            }
+        }
+        XCTAssertThrowsError(try restarted.check(root: "root", on: market, now: 0)) {
+            XCTAssertEqual($0 as? SponsorRefusal, .blocked, "work and coin for it are refused too")
+        }
+    }
+
+    func testATakedownRefusesWorkForAnUploadNotYetPinned() throws {
+        var storage = try storage()
+        _ = try storage.upload(root: "root", volumes: volumes, now: 0)
+        try pay(2, to: "root", &storage)
+        XCTAssertEqual(try storage.block("root"), ["root"], "nothing of it is pinned but the CID itself")
+        XCTAssertThrowsError(try storage.credit(root: "root", value: SponsorLedger.unit, on: market, now: 1)) {
+            XCTAssertEqual($0 as? SponsorRefusal, .blocked, "its paid bytes are not refunded")
+        }
+        XCTAssertNil(storage.takePaid("root"))
+        XCTAssertEqual(storage.use(now: 0).held, 0)
+    }
+
+    func testATakedownKeepsAVolumeAnotherUploadStillHolds() async throws {
+        var storage = try storage()
+        let fake = FakeNode(served: ["other": ["other": bytes(10)]])
+        try await store("root", volumes, in: &storage, on: fake)
+        try await store("b", [StoreVolume(cid: "b", entries: ["b": bytes(5)]), StoreVolume(cid: "other", bytes: 10)], in: &storage, on: fake)
+        let released = try storage.block("root")
+        XCTAssertEqual(released, ["root"], "b still holds other")
+        try await fake.node.unpin(released)
+        try storage.release("root")
+        XCTAssertEqual(Set(fake.pins.keys), ["b", "other"])
+        XCTAssertEqual(storage.status(of: "b")?.stored, true)
+    }
+
+    func testTheBudgetCountsHeldAndPinnedBytes() async throws {
+        var storage = try storage(budget: 30)
+        let fake = FakeNode(served: ["other": ["other": bytes(10)]])
+        try await store("root", volumes, in: &storage, on: fake)
+        _ = try storage.upload(root: "b", volumes: [StoreVolume(cid: "b", entries: ["b": bytes(5)])], now: 0)
+        XCTAssertEqual(storage.use(now: 0), StorageUse(budget: 30, stored: 25, held: 5))
+        XCTAssertThrowsError(try storage.upload(root: "c", volumes: [StoreVolume(cid: "c", bytes: 1)], now: 0)) {
+            XCTAssertEqual($0 as? SponsorRefusal, .overBudget, "25 pinned and 5 held of 30")
+        }
+        XCTAssertEqual(storage.use(now: 3_600_000).held, 0, "an unpaid upload's hold ends with it")
     }
 }
