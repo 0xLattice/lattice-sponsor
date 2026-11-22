@@ -105,8 +105,24 @@ final class ServingCreditTests: XCTestCase {
     }
 
     func testTheTermsListServingRates() throws {
-        let terms = SponsorTerms(payTo: nil, depth: 6, storageRates: [:], servingRates: [market: 1024])
+        let terms = SponsorTerms(address: "a", payTo: nil, depth: 6, storageRates: [:], servingRates: [market: 1024])
         let json = try JSONSerialization.jsonObject(with: JSONEncoder().encode(terms)) as! [String: Any]
         XCTAssertEqual(json["servingRates"] as? [String: Int], ["Nexus/Market": 1024])
+    }
+
+    func testTheTermsNameTheSponsorsAddressWithOrWithoutFunds() throws {
+        func json(funds: Bool) throws -> [String: Any] {
+            let terms = SponsorTerms(
+                address: "sponsor", payTo: "host", depth: 6, storageRates: [:], servingRates: [:], funds: funds
+            )
+            return try JSONSerialization.jsonObject(with: JSONEncoder().encode(terms)) as! [String: Any]
+        }
+        let plain = try json(funds: false)
+        XCTAssertEqual(plain["address"] as? String, "sponsor")
+        XCTAssertEqual(plain["payTo"] as? String, "host")
+        XCTAssertNil(plain["fundTo"])
+        let funded = try json(funds: true)
+        XCTAssertEqual(funded["address"] as? String, "sponsor")
+        XCTAssertEqual(funded["fundTo"] as? String, funded["address"] as? String)
     }
 }

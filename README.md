@@ -49,7 +49,8 @@ lattice-sponsor \
 - `--serving-rate` lets work buy a peer serving standing on the node (see
   [Serving](#serving)).
 - `--pay-to` lets coin buy storage or serving too (see
-  [Paying in coin](#paying-in-coin)), with `--coin-depth`.
+  [Paying in coin](#paying-in-coin)), with `--coin-depth`. Without either, it
+  only publishes the address as `payTo` in `GET /terms`.
 - `--funds` lets a site lend the sponsor float for the transactions under
   some key prefixes (see [Funds](#funds)), with `--funded-only`.
 - `--payout-at` lets work earn coin outright: work naming a `payTo` address
@@ -79,7 +80,7 @@ JSON; 64-bit integers are decimal strings, and targets and work are hex.
 | `POST /pay` | `{chain, txCID, signer, signature, store \| peer \| fund}` | `{bytes}` bought, and a fund's `deposit` |
 | `GET /fund?chain=<path>&prefix=<p>...` | | `{deposit, held}` |
 | `GET /earnings?chain=<path>&address=<a>` | | `{earned, payoutAt, paying}`, with `--payout-at` |
-| `GET /terms` | | `{payTo, depth, storageRates, servingRates, fundTo?, payoutAt?}` |
+| `GET /terms` | | `{address, payTo, depth, storageRates, servingRates, fundTo?, payoutAt?}`; `address` is the sponsor key's own, always |
 
 With a `pay`, the sponsor credits the client `pay` within the transaction, and
 debits itself the fee plus `pay`. The client's own debits net against that
