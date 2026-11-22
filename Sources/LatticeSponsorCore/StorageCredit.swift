@@ -85,9 +85,16 @@ public struct StorageLedger: Sendable {
         /// Bytes paid, scaled by 2^64 as fee credit is.
         var paid: UInt256 = .zero
         var pinning = false
+        /// The sponsor has tried to pin it: some of its Volumes may be
+        /// pinned even if it never was in full.
+        var attempted = false
     }
 
     private var pending: [String: Upload] = [:]
+    /// The Volumes of uploads taken down after a failed pin attempt, by the
+    /// CID taken down, until `release`: a takedown asked again unpins them
+    /// again.
+    private var abandoned: [String: Set<String>] = [:]
     /// Each pinned root's bytes, as kept in `file`.
     public private(set) var stored: [String: Int] = [:]
     /// Each pinned root's Volumes.
@@ -203,18 +210,19 @@ public struct StorageLedger: Sendable {
         guard let upload = pending[root], !upload.pinning,
               upload.paid >= UInt256(UInt64(upload.bytes)) * SponsorLedger.unit else { return nil }
         pending[root]!.pinning = true
+        pending[root]!.attempted = true
         return upload
     }
 
     /// Record `root` as stored, once each of its Volumes is pinned, or with
     /// `pinned` false, hand it back to be pinned again. False when the upload
-    /// was taken down while it was being pinned: its Volumes are then the
-    /// caller's to unpin (`unreferenced`).
+    /// was taken down while it was being pinned, pinned in full or not: its
+    /// Volumes are then the caller's to unpin (`unreferenced`).
     @discardableResult
     public mutating func finish(_ root: String, pinned: Bool) throws -> Bool {
         guard pinned else {
             pending[root]?.pinning = false
-            return true
+            return pending[root] != nil
         }
         guard let upload = pending.removeValue(forKey: root) else { return false }
         stored[root] = upload.bytes
@@ -227,8 +235,9 @@ public struct StorageLedger: Sendable {
     /// of each upload naming it as its root or a Volume, pinned or not, so
     /// no other upload listing those Volumes pins them again; and drop those
     /// not yet pinned. Answers the Volumes to unpin on the node: those of
-    /// each pinned upload naming it that no other upload keeps, pinned or
-    /// being pinned. Only Volumes of the sponsor's own uploads are ever
+    /// each pinned upload naming it, and of each the sponsor tried to pin
+    /// before (an upload being pinned is unpinned when its attempt ends),
+    /// that no other upload keeps, pinned or being pinned. Only Volumes of the sponsor's own uploads are ever
     /// unpinned. The pinned uploads stay counted until `release`, so a
     /// takedown whose unpinning fails is simply asked again.
     public mutating func block(_ cid: String) throws -> [String] {
@@ -242,13 +251,17 @@ public struct StorageLedger: Sendable {
             try saveBlocklist()
         }
         for root in dropped.keys { pending[root] = nil }
+        for upload in dropped.values where upload.attempted && !upload.pinning {
+            abandoned[cid, default: []].formUnion(upload.volumes.map(\.cid))
+        }
         let kept = keptVolumes(excluding: roots)
-        return Set(roots.flatMap { volumes[$0]! }).subtracting(kept).sorted()
+        return Set(roots.flatMap { volumes[$0]! }).union(abandoned[cid] ?? []).subtracting(kept).sorted()
     }
 
     /// Forget the pinned uploads naming the blocked `cid`, once their
     /// Volumes are unpinned: their bytes return to the budget.
     public mutating func release(_ cid: String) throws {
+        abandoned[cid] = nil
         let roots = volumes.filter { $0.key == cid || $0.value.contains(cid) }.keys
         guard !roots.isEmpty else { return }
         for root in roots {

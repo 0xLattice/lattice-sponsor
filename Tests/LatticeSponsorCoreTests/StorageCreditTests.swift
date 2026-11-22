@@ -305,4 +305,35 @@ final class StorageCreditTests: XCTestCase {
         let mode = try FileManager.default.attributesOfItem(atPath: blocklist.path)[.posixPermissions] as? NSNumber
         XCTAssertEqual(mode?.intValue, 0o600)
     }
+
+    func testATakedownReleasesWhatAFailedPinLeftPinned() async throws {
+        var storage = try storage()
+        // `other` cannot be fetched, so the pin stops after `root`.
+        let fake = FakeNode()
+        _ = try storage.upload(root: "root", volumes: volumes, now: 0)
+        try pay(3, to: "root", &storage)
+        let upload = try XCTUnwrap(storage.takePaid("root"))
+        do {
+            try await fake.node.pin(upload)
+            XCTFail("other is not served")
+        } catch {}
+        XCTAssertTrue(try storage.finish("root", pinned: false), "held, to be pinned again")
+        XCTAssertEqual(Set(fake.pins.keys), ["root"])
+
+        let released = try storage.block("root")
+        XCTAssertEqual(released, ["other", "root"], "every Volume it tried to pin")
+        try await fake.node.unpin(released)
+        try storage.release("root")
+        XCTAssertEqual(fake.pins, [:], "the partly pinned Volume is released; the unpinned one is not pinned (404)")
+    }
+
+    func testAFailedPinOfAnUploadTakenDownMeanwhileIsTheCallersToUnpin() throws {
+        var storage = try storage()
+        _ = try storage.upload(root: "root", volumes: volumes, now: 0)
+        try pay(3, to: "root", &storage)
+        _ = try XCTUnwrap(storage.takePaid("root"))
+        XCTAssertEqual(try storage.block("root"), [], "being pinned: unpinned when its attempt ends")
+        XCTAssertFalse(try storage.finish("root", pinned: false))
+        XCTAssertEqual(storage.unreferenced(["root", "other"]), ["root", "other"])
+    }
 }

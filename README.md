@@ -166,7 +166,9 @@ the node's own operator routes, sent the same way:
   of that other file is refused, though one already pinned keeps it.
   `POST /sponsor` pins nothing;
 - unpins, with the node's `DELETE /pins/:cid`, every Volume of the pinned
-  uploads naming it that no other upload, pinned or being pinned, keeps, so
+  uploads naming it, and of those it tried to pin before and failed, that no
+  other upload, pinned or being pinned, keeps (a Volume the node does not
+  hold, 404, is already released), so
   the node releases them as it does any unpinned Volume. It unpins only
   Volumes of its own uploads, never a pin it did not make. It drops any upload
   naming the CID not yet pinned (one being pinned is unpinned once it is);
