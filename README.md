@@ -43,9 +43,11 @@ lattice-sponsor \
   buying a name, say. It defaults to the chain's block reward at the
   template's height; at 0 it pays fees only.
 
-- `--sell-storage` lets work buy a permanent pin for a file (see
-  [Storage](#storage)), with `--storage-budget`, `--storage-rate` and
-  `--storage-file`.
+- `--sell-storage` lets work buy a pin for a file, kept until the operator
+  takes it down (see [Storage](#storage) and
+  [Abuse and takedowns](#abuse-and-takedowns)), with `--storage-rate`,
+  `--storage-file` and `--storage-budget`: the most bytes pinned at once,
+  uploads not yet pinned included (default `1073741824`, 1 GiB).
 - `--serving-rate` lets work buy a peer serving standing on the node (see
   [Serving](#serving)).
 - `--pay-to` lets coin buy storage or serving too (see
@@ -80,7 +82,8 @@ JSON; 64-bit integers are decimal strings, and targets and work are hex.
 | `POST /pay` | `{chain, txCID, signer, signature, store \| peer \| fund}` | `{bytes}` bought, and a fund's `deposit` |
 | `GET /fund?chain=<path>&prefix=<p>...` | | `{deposit, held}` |
 | `GET /earnings?chain=<path>&address=<a>` | | `{earned, payoutAt, paying}`, with `--payout-at` |
-| `GET /terms` | | `{address, payTo, depth, storageRates, servingRates, fundTo?, payoutAt?}`; `address` is the sponsor key's own, always |
+| `GET /terms` | | `{address, payTo, depth, storageRates, servingRates, fundTo?, payoutAt?, storage?}`; `address` is the sponsor key's own, always; with `--sell-storage`, `storage` is `{budget, stored, held}` in bytes |
+| `POST /takedown` | `{cid}` | `{cid, unpinned}`; operator only (see [Abuse and takedowns](#abuse-and-takedowns)) |
 
 With a `pay`, the sponsor credits the client `pay` within the transaction, and
 debits itself the fee plus `pay`. The client's own debits net against that
@@ -109,12 +112,12 @@ Three refusals carry `Retry-After` in seconds, exposed to pages
 `notDeepEnough` (425). Each clears as the chain moves, so the value is a hint:
 no clock predicts when it does. `unpriceable` and `insufficientFloat` (503)
 carry none: they may never clear (a chain whose emission has ended, a sponsor
-with no float).
+with no float). Nor does `blocked` (451): the operator took the CID down.
 
 ## Storage
 
-A storage sponsor keeps files forever, for proof of work that mines real
-blocks. Anyone can run one, and an uploader can use several. The uploader
+A storage sponsor keeps files, for proof of work that mines real blocks, until
+its operator takes one down. Anyone can run one, and an uploader can use several. The uploader
 trusts the host for availability only: bytes are checked by CID.
 
 With `--sell-storage`, an uploader sends `POST /store` with the file's root
@@ -124,7 +127,10 @@ to be read later with the node's `GET /fetch` (and refused if larger). A
 Volume's entries include its root, and a Volume is at most 1 MiB and 1 KiB
 (a 1 MiB chunk of a file and its block's framing). An
 upload that does not fit in what is left of `--storage-budget` is refused
-(`overBudget`). The answer's `needed` is the coins of work still owed on each
+(`overBudget`, 400): the budget counts every byte pinned and every upload not
+yet pinned, so a paid upload always fits. `GET /terms` answers
+`storage: {budget, stored, held}`; room for an upload is
+`budget - stored - held`. The answer's `needed` is the coins of work still owed on each
 chain `--storage-rate <chain>=<bytesPerCoin>` prices; `credit` is the bytes
 paid.
 
@@ -132,10 +138,56 @@ The uploader then asks `POST /work` with `store: <root>` on a chain with a
 storage rate (otherwise `noStorageRate`), and posts shares as usual. Storage
 credit pays no fee or `pay`. Once it covers the upload's bytes, the
 sponsor pins every Volume with the node's `POST /pins`, which checks each
-against its CID, and adds `{root, bytes}` to `--storage-file`. Nothing is
-ever unpinned. An upload not yet paid is held in memory for an hour, and a
+against its CID, and adds `{root, bytes, volumes}` to `--storage-file`. It
+stays pinned until the operator takes it down. An upload not yet paid is held in memory for an hour, and a
 paid one until it is pinned; a restart forfeits either, with its credit, as it
 does fee credit.
+
+## Abuse and takedowns
+
+Every pinned file is served by the operator's node, from the operator's IP
+address, to anyone who asks for it. The sponsor does not look at what it pins:
+anyone who pays can upload anything, so the operator answers for what it
+serves and must be able to remove it.
+
+`POST /takedown {"cid": "<cid>"}` takes a CID down: an upload's root, or one
+of its Volumes. It needs the node's RPC cookie, the operator's credential for
+the node's own operator routes, sent the same way:
+`Authorization: Basic <base64 of the --cookie-file's content>` (otherwise
+401). The sponsor then:
+
+- blocks the CID, and the root and every Volume of each upload naming it,
+  pinned or not, for good, in `lattice-sponsor-blocklist.json` beside
+  `--storage-file` (mode 0600). An upload naming a blocked CID as its root or
+  a Volume is refused (`blocked`, 451) on `POST /store`, and so is work or
+  coin for it on `POST /work`, `POST /shares` and `POST /pay`, so a new
+  manifest listing the same chunks cannot pin them again. A Volume the
+  taken-down file shares with an innocuous one is blocked too: a later upload
+  of that other file is refused, though one already pinned keeps it.
+  `POST /sponsor` pins nothing;
+- unpins, with the node's `DELETE /pins/:cid`, every Volume of the pinned
+  uploads naming it, and of those it tried to pin before and failed, that no
+  other upload, pinned or being pinned, keeps (a Volume the node does not
+  hold, 404, is already released), so
+  the node releases them as it does any unpinned Volume. It unpins only
+  Volumes of its own uploads, never a pin it did not make. It drops any upload
+  naming the CID not yet pinned (one being pinned is unpinned once it is);
+- returns their bytes to `--storage-budget`.
+
+It answers the Volumes it unpinned. If the node refuses an unpin, the CID is
+still blocked and the answer is `notUnpinned` (502): ask again. To unblock a
+CID, remove it from the blocklist file and restart.
+
+**Paid time is not refunded.** Work or coin spent on an upload taken down,
+pinned or not, is forfeited: the sponsor holds no refund float, and refunding
+would pay whoever uploaded what had to be removed. An uploader who needs the
+file kept stores it with other sponsors too.
+
+The sponsor logs, to standard output, each upload it pins (root, bytes,
+Volumes) and each takedown (the CID and the Volumes unpinned). It logs no
+uploader's address or identity: `--storage-file` holds only roots, bytes and
+Volumes, and the blocklist only CIDs. Logs of who connected are the
+operator's own proxy's.
 
 ## Serving
 

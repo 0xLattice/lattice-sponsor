@@ -1,3 +1,4 @@
+import Foundation
 import Hummingbird
 import HummingbirdTesting
 @testable import LatticeSponsor
@@ -14,7 +15,42 @@ final class RefusalResponseTests: XCTestCase {
         router.post("notDeepEnough") { _, _ -> String in try await refusing { throw SponsorRefusal.notDeepEnough } }
         router.post("insufficientFloat") { _, _ -> String in try await refusing { throw SponsorRefusal.insufficientFloat } }
         router.post("unpriceable") { _, _ -> String in try await refusing { throw SponsorRefusal.unpriceable } }
+        router.post("blocked") { _, _ -> String in try await refusing { throw SponsorRefusal.blocked } }
+        router.post("operator") { request, _ -> String in
+            try requireOperator(request, cookie: Self.cookie)
+            return "ok"
+        }
         return Application(router: router)
+    }
+
+    private static let cookie = FileManager.default.temporaryDirectory.appendingPathComponent("sponsor-cookie-\(UUID().uuidString)")
+
+    func testATakenDownCIDIsRefusedAsUnavailableForLegalReasons() async throws {
+        try await app().test(.router) { client in
+            try await client.execute(uri: "/blocked", method: .post, headers: Self.origin) { response in
+                XCTAssertEqual(response.status.code, 451)
+                XCTAssertEqual(String(buffer: response.body), #"{"error":{"message":"blocked"}}"#)
+                XCTAssertNil(response.headers[.retryAfter], "it never clears")
+            }
+        }
+    }
+
+    func testAnOperatorRouteTakesOnlyTheNodesCookie() async throws {
+        try Data("__cookie__:secret\n".utf8).write(to: Self.cookie)
+        defer { try? FileManager.default.removeItem(at: Self.cookie) }
+        let good = "Basic " + Data("__cookie__:secret".utf8).base64EncodedString()
+        let bad = "Basic " + Data("__cookie__:guess".utf8).base64EncodedString()
+        try await app().test(.router) { client in
+            try await client.execute(uri: "/operator", method: .post) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+            try await client.execute(uri: "/operator", method: .post, headers: [.authorization: bad]) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+            try await client.execute(uri: "/operator", method: .post, headers: [.authorization: good]) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+        }
     }
 
     private static let origin: HTTPFields = [.origin: "https://app.example"]

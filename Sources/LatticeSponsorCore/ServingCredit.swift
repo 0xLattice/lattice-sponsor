@@ -56,12 +56,15 @@ public struct SponsorTerms: Codable, Sendable {
     public let fundTo: String?
     /// With --payout-at, the coins at which work's earnings are paid out.
     @OptionalDecimalString public var payoutAt: UInt64?
+    /// With --sell-storage, the budget and what holds it.
+    public let storage: StorageUse?
 
     public init(
         address: String, payTo: String?, depth: UInt64, storageRates: [[String]: Int],
-        servingRates: [[String]: Int], funds: Bool = false, payoutAt: UInt64? = nil
+        servingRates: [[String]: Int], funds: Bool = false, payoutAt: UInt64? = nil, storage: StorageUse? = nil
     ) {
         self.address = address
+        self.storage = storage
         self.payoutAt = payoutAt
         func named(_ rates: [[String]: Int]) -> [String: Int] {
             Dictionary(uniqueKeysWithValues: rates.map { ($0.key.joined(separator: "/"), $0.value) })

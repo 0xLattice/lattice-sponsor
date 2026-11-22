@@ -58,6 +58,8 @@ let package = Package(
             dependencies: [
                 "LatticeSponsor",
                 "LatticeSponsorCore",
+                .product(name: "Lattice", package: "lattice"),
+                .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "HummingbirdTesting", package: "hummingbird"),
             ]),

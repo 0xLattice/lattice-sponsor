@@ -133,6 +133,9 @@ public enum SponsorRefusal: Error, Sendable, Equatable {
     case overBudget
     /// No upload is held under that root: it expired, or was never made.
     case unknownUpload
+    /// The operator took the CID down: no upload naming it is taken, paid
+    /// or pinned again.
+    case blocked
     /// The transaction is not in the node's canonical chain.
     case notIncluded
     /// Too few blocks are built on the transaction's block yet; retry later.

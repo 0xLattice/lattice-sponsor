@@ -2,15 +2,18 @@
 // uploader lists every Volume of its file, root included, and pays for its
 // bytes in work at a rate in bytes per coin of each chain the sponsor names.
 // Once paid, the sponsor pins every Volume on its node, which checks each
-// against its CID, and keeps it forever: nothing is ever unpinned. The roots
-// stored, and their bytes, are kept in one JSON file, which counts the budget
-// across restarts. An upload not yet paid is held in memory for at most
-// `lifetime`, and a paid one until it is pinned; a restart forfeits either.
+// against its CID, and keeps it until the operator takes it down: then every
+// Volume of it is unpinned and its CID blocked, so no upload pins it again.
+// The roots stored, their bytes and Volumes are kept in one JSON file, which
+// counts the budget across restarts, and the CIDs blocked in another beside
+// it. An upload not yet paid is held in memory for at most `lifetime`, and a
+// paid one until it is pinned; a restart forfeits either.
 
 import Foundation
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
+import LatticeNodeAPI
 import UInt256
 
 /// One Volume of an upload: its entries (CID to base64 bytes, as the node's
@@ -39,8 +42,25 @@ public struct StoreStatus: Sendable, Equatable {
     public let stored: Bool
 }
 
+/// The storage budget and what holds it, as `GET /terms` answers it: room
+/// for a new upload is `budget - stored - held`.
+public struct StorageUse: Codable, Sendable, Equatable {
+    /// The most bytes pinned at once (`--storage-budget`).
+    @DecimalString public var budget: UInt64
+    /// The bytes pinned.
+    @DecimalString public var stored: UInt64
+    /// The bytes reserved by uploads not yet pinned.
+    @DecimalString public var held: UInt64
+
+    public init(budget: UInt64, stored: UInt64, held: UInt64) {
+        self.budget = budget
+        self.stored = stored
+        self.held = held
+    }
+}
+
 public struct StorageLedger: Sendable {
-    /// The most bytes ever pinned.
+    /// The most bytes pinned at once.
     public let budget: Int
     /// Bytes per coin (the chain's smallest unit) on each chain.
     public let rates: [[String]: Int]
@@ -49,6 +69,8 @@ public struct StorageLedger: Sendable {
     /// How long an upload not yet pinned is held.
     public let lifetime: Int64
     let file: URL
+    /// The CIDs the operator took down, kept beside `file`.
+    let blocklistFile: URL
     /// The most bytes in one Volume, raw, and as the body of its pin: the
     /// node takes a `POST /pins` body of at most 2 MiB. A raw Volume holds a
     /// 1 MiB chunk of file bytes and its block's DAG-CBOR framing, as
@@ -63,18 +85,33 @@ public struct StorageLedger: Sendable {
         /// Bytes paid, scaled by 2^64 as fee credit is.
         var paid: UInt256 = .zero
         var pinning = false
+        /// The sponsor has tried to pin it: some of its Volumes may be
+        /// pinned even if it never was in full.
+        var attempted = false
     }
 
     private var pending: [String: Upload] = [:]
+    /// The Volumes of uploads taken down after a failed pin attempt, by the
+    /// CID taken down, until `release`: a takedown asked again unpins them
+    /// again.
+    private var abandoned: [String: Set<String>] = [:]
     /// Each pinned root's bytes, as kept in `file`.
     public private(set) var stored: [String: Int] = [:]
+    /// Each pinned root's Volumes.
+    private var volumes: [String: [String]] = [:]
+    /// The CIDs taken down: no upload naming one as its root or a Volume is
+    /// taken, paid or pinned.
+    public private(set) var blocked: Set<String> = []
 
     private struct Record: Codable {
         let root: String
         let bytes: Int
+        /// Absent in a file written before takedowns: the root alone.
+        let volumes: [String]?
     }
 
-    /// Read what `file` says is stored, if it exists.
+    /// Read what `file` says is stored, and the CIDs blocked beside it
+    /// (`lattice-sponsor-blocklist.json`), if they exist.
     public init(
         budget: Int, rates: [[String]: Int], file: URL,
         pendingCap: Int = 256 << 20, lifetime: Int64 = 3_600_000
@@ -84,11 +121,23 @@ public struct StorageLedger: Sendable {
         self.file = file
         self.pendingCap = pendingCap
         self.lifetime = lifetime
+        self.blocklistFile = file.deletingLastPathComponent().appendingPathComponent("lattice-sponsor-blocklist.json")
         if FileManager.default.fileExists(atPath: file.path) {
             for record in try JSONDecoder().decode([Record].self, from: Data(contentsOf: file)) {
                 stored[record.root] = record.bytes
+                volumes[record.root] = record.volumes ?? [record.root]
             }
         }
+        if FileManager.default.fileExists(atPath: blocklistFile.path) {
+            blocked = Set(try JSONDecoder().decode([String].self, from: Data(contentsOf: blocklistFile)))
+        }
+    }
+
+    /// The budget, the bytes pinned, and the bytes held for uploads.
+    public func use(now: Int64) -> StorageUse {
+        var held = 0
+        for upload in pending.values where isLive(upload, now: now) { held += upload.bytes }
+        return StorageUse(budget: UInt64(budget), stored: UInt64(stored.values.reduce(0, +)), held: UInt64(held))
     }
 
     /// The chain's bytes per coin.
@@ -102,6 +151,9 @@ public struct StorageLedger: Sendable {
     /// always fits.
     public mutating func upload(root: String, volumes: [StoreVolume], now: Int64) throws -> StoreStatus {
         sweep(now: now)
+        guard !blocked.contains(root), !volumes.contains(where: { blocked.contains($0.cid) }) else {
+            throw SponsorRefusal.blocked
+        }
         guard pending[root] == nil, stored[root] == nil else { throw SponsorRefusal.draft("root already uploaded") }
         guard volumes.contains(where: { $0.cid == root }) else { throw SponsorRefusal.draft("the root is not listed") }
         var bytes = 0
@@ -138,6 +190,7 @@ public struct StorageLedger: Sendable {
 
     /// Refuse work for `root` unless it is held and `chainPath` has a rate.
     public func check(root: String, on chainPath: [String], now: Int64) throws {
+        guard !blocked.contains(root) else { throw SponsorRefusal.blocked }
         _ = try rate(on: chainPath)
         guard let upload = pending[root], now - upload.created < lifetime else { throw SponsorRefusal.unknownUpload }
     }
@@ -157,19 +210,89 @@ public struct StorageLedger: Sendable {
         guard let upload = pending[root], !upload.pinning,
               upload.paid >= UInt256(UInt64(upload.bytes)) * SponsorLedger.unit else { return nil }
         pending[root]!.pinning = true
+        pending[root]!.attempted = true
         return upload
     }
 
     /// Record `root` as stored, once each of its Volumes is pinned, or with
-    /// `pinned` false, hand it back to be pinned again.
-    public mutating func finish(_ root: String, pinned: Bool) throws {
+    /// `pinned` false, hand it back to be pinned again. False when the upload
+    /// was taken down while it was being pinned, pinned in full or not: its
+    /// Volumes are then the caller's to unpin (`unreferenced`).
+    @discardableResult
+    public mutating func finish(_ root: String, pinned: Bool) throws -> Bool {
         guard pinned else {
             pending[root]?.pinning = false
-            return
+            return pending[root] != nil
         }
-        guard let upload = pending.removeValue(forKey: root) else { return }
+        guard let upload = pending.removeValue(forKey: root) else { return false }
         stored[root] = upload.bytes
-        let records = stored.map { Record(root: $0.key, bytes: $0.value) }.sorted { $0.root < $1.root }
+        volumes[root] = upload.volumes.map(\.cid)
+        try save()
+        return true
+    }
+
+    /// Take `cid` down: block it for good, with the root and every Volume
+    /// of each upload naming it as its root or a Volume, pinned or not, so
+    /// no other upload listing those Volumes pins them again; and drop those
+    /// not yet pinned. Answers the Volumes to unpin on the node: those of
+    /// each pinned upload naming it, and of each the sponsor tried to pin
+    /// before (an upload being pinned is unpinned when its attempt ends),
+    /// that no other upload keeps, pinned or being pinned. Only Volumes of the sponsor's own uploads are ever
+    /// unpinned. The pinned uploads stay counted until `release`, so a
+    /// takedown whose unpinning fails is simply asked again.
+    public mutating func block(_ cid: String) throws -> [String] {
+        let dropped = pending.filter { $0.key == cid || $0.value.volumes.contains { $0.cid == cid } }
+        let roots = Set(volumes.filter { $0.key == cid || $0.value.contains(cid) }.keys)
+        let blocking = Set(roots.flatMap { volumes[$0]! })
+            .union(dropped.values.flatMap { $0.volumes.map(\.cid) })
+            .union(roots).union(dropped.keys).union([cid])
+        if !blocking.isSubset(of: blocked) {
+            blocked.formUnion(blocking)
+            try saveBlocklist()
+        }
+        for root in dropped.keys { pending[root] = nil }
+        for upload in dropped.values where upload.attempted && !upload.pinning {
+            abandoned[cid, default: []].formUnion(upload.volumes.map(\.cid))
+        }
+        let kept = keptVolumes(excluding: roots)
+        return Set(roots.flatMap { volumes[$0]! }).union(abandoned[cid] ?? []).subtracting(kept).sorted()
+    }
+
+    /// Forget the pinned uploads naming the blocked `cid`, once their
+    /// Volumes are unpinned: their bytes return to the budget.
+    public mutating func release(_ cid: String) throws {
+        abandoned[cid] = nil
+        let roots = volumes.filter { $0.key == cid || $0.value.contains(cid) }.keys
+        guard !roots.isEmpty else { return }
+        for root in roots {
+            stored[root] = nil
+            volumes[root] = nil
+        }
+        try save()
+    }
+
+    /// Of `cids`, those no upload keeps, pinned or being pinned.
+    public func unreferenced(_ cids: [String]) -> [String] {
+        let kept = keptVolumes(excluding: [])
+        return cids.filter { !kept.contains($0) }
+    }
+
+    /// The Volumes of the pinned uploads but `roots`, and of the uploads
+    /// being pinned.
+    private func keptVolumes(excluding roots: Set<String>) -> Set<String> {
+        Set(volumes.filter { !roots.contains($0.key) }.values.joined())
+            .union(pending.values.filter(\.pinning).flatMap { $0.volumes.map(\.cid) })
+    }
+
+    /// The blocklist, readable by the operator alone.
+    private func saveBlocklist() throws {
+        try JSONEncoder().encode(blocked.sorted()).write(to: blocklistFile, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: blocklistFile.path)
+    }
+
+    private func save() throws {
+        let records = stored.map { Record(root: $0.key, bytes: $0.value, volumes: volumes[$0.key]) }
+            .sorted { $0.root < $1.root }
         try JSONEncoder().encode(records).write(to: file, options: .atomic)
     }
 
@@ -193,9 +316,11 @@ public struct StorageLedger: Sendable {
     /// Drop uploads held past `lifetime`, except one paid in full: some of
     /// its Volumes may be pinned already, so it keeps its bytes reserved.
     private mutating func sweep(now: Int64) {
-        pending = pending.filter {
-            $0.value.paid >= UInt256(UInt64($0.value.bytes)) * SponsorLedger.unit || now - $0.value.created < lifetime
-        }
+        pending = pending.filter { isLive($0.value, now: now) }
+    }
+
+    private func isLive(_ upload: Upload, now: Int64) -> Bool {
+        upload.paid >= UInt256(UInt64(upload.bytes)) * SponsorLedger.unit || now - upload.created < lifetime
     }
 }
 
@@ -224,6 +349,18 @@ extension SponsorNode {
             pin.setValue("application/json", forHTTPHeaderField: "Content-Type")
             pin.httpBody = try JSONEncoder().encode(Pin(cid: volume.cid, entries: entries))
             _ = try await call(pin)
+        }
+    }
+
+    /// Unpin each of `cids` on the node with `DELETE /pins/:cid`; one the
+    /// node does not hold (404) is already released.
+    public func unpin(_ cids: [String]) async throws {
+        for cid in cids {
+            var delete = request("pins/\(cid)")
+            delete.httpMethod = "DELETE"
+            do {
+                _ = try await call(delete)
+            } catch Failure.status(404) {}
         }
     }
 }
