@@ -11,6 +11,9 @@ final class RefusalResponseTests: XCTestCase {
         router.add(middleware: sponsorCORS())
         router.post("busy") { _, _ -> String in try await refusing { throw SponsorRefusal.busy } }
         router.post("unknown") { _, _ -> String in try await refusing { throw SponsorRefusal.unknownAssignment } }
+        router.post("notDeepEnough") { _, _ -> String in try await refusing { throw SponsorRefusal.notDeepEnough } }
+        router.post("insufficientFloat") { _, _ -> String in try await refusing { throw SponsorRefusal.insufficientFloat } }
+        router.post("unpriceable") { _, _ -> String in try await refusing { throw SponsorRefusal.unpriceable } }
         return Application(router: router)
     }
 
@@ -35,6 +38,29 @@ final class RefusalResponseTests: XCTestCase {
                 XCTAssertEqual(response.headers[.retryAfter], "\(retryAfterSeconds)")
                 XCTAssertEqual(response.headers[.accessControlExposeHeaders], "Retry-After")
                 XCTAssertEqual(String(buffer: response.body), #"{"error":{"message":"busy"}}"#)
+            }
+        }
+    }
+
+    func testATooEarlyRefusalSaysWhenToRetry() async throws {
+        try await app().test(.router) { client in
+            try await client.execute(uri: "/notDeepEnough", method: .post, headers: Self.origin) { response in
+                XCTAssertEqual(response.status.code, 425)
+                XCTAssertEqual(response.headers[.accessControlAllowOrigin], "*")
+                XCTAssertEqual(response.headers[.retryAfter], "\(retryAfterSeconds)")
+                XCTAssertEqual(response.headers[.accessControlExposeHeaders], "Retry-After")
+            }
+        }
+    }
+
+    func testARefusalThatMayNeverClearSaysNoRetry() async throws {
+        try await app().test(.router) { client in
+            for uri in ["/insufficientFloat", "/unpriceable"] {
+                try await client.execute(uri: uri, method: .post, headers: Self.origin) { response in
+                    XCTAssertEqual(response.status, .serviceUnavailable, uri)
+                    XCTAssertEqual(response.headers[.accessControlAllowOrigin], "*", uri)
+                    XCTAssertNil(response.headers[.retryAfter], uri)
+                }
             }
         }
     }

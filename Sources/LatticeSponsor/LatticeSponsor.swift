@@ -981,16 +981,16 @@ private func now() -> Int64 {
 /// requests: a client's token is in its body. Every answer carries the
 /// origin header, a refusal too, so a page can read why it was refused.
 func sponsorCORS<Context: RequestContext>() -> CORSMiddleware<Context> {
-    CORSMiddleware(allowOrigin: .all, allowMethods: [.get, .post, .options], exposedHeaders: ["Retry-After"])
+    CORSMiddleware(allowOrigin: .all, allowMethods: [.get, .post, .options])
 }
 
-/// Seconds a refusal that clears by itself asks the client to wait. A hint,
-/// not a deadline: these clear when the chain or the sponsor's templates
-/// move, which no clock predicts.
+/// Seconds a refusal that clears as the chain moves asks the client to wait.
+/// A hint, not a deadline: no clock predicts when the chain moves.
 let retryAfterSeconds = 5
 
 /// A refusal as the client's 4xx; anything else propagates. One that clears
-/// by itself (503, 425) carries `Retry-After`, exposed to pages.
+/// as the chain moves (busy, soldOut, notDeepEnough) carries `Retry-After`,
+/// exposed to pages; unpriceable and insufficientFloat may never clear.
 func refusing<Value: Sendable>(_ body: () async throws -> Value) async throws -> Value {
     do {
         return try await body()
@@ -1006,11 +1006,13 @@ func refusing<Value: Sendable>(_ body: () async throws -> Value) async throws ->
         default: .badRequest
         }
         var headers = HTTPFields()
-        if status == .serviceUnavailable || status.code == 425 {
+        switch refusal {
+        case .busy, .soldOut, .notDeepEnough:
             headers[.retryAfter] = "\(retryAfterSeconds)"
             // Hummingbird exposes headers on the preflight only, and a page
             // reads a header only when the answer itself exposes it.
             headers[.accessControlExposeHeaders] = "Retry-After"
+        default: break
         }
         throw HTTPError(status, headers: headers, message: "\(refusal)")
     }

@@ -103,11 +103,12 @@ the new range.
   the shares are credited on has moved past the block it carries, so its
   shares can no longer win it.
 
-A refusal that clears by itself, without the client changing anything, is a
-503 (`busy`, `soldOut`, `unpriceable`, `insufficientFloat`) or 425
-(`notDeepEnough`), and carries `Retry-After` in seconds, exposed to pages
-(`Access-Control-Expose-Headers`). It is a hint: these clear when the chain or
-the sponsor's templates move, which no clock predicts.
+Three refusals carry `Retry-After` in seconds, exposed to pages
+(`Access-Control-Expose-Headers`): `busy` and `soldOut` (503) and
+`notDeepEnough` (425). Each clears as the chain moves, so the value is a hint:
+no clock predicts when it does. `unpriceable` and `insufficientFloat` (503)
+carry none: they may never clear (a chain whose emission has ended, a sponsor
+with no float).
 
 ## Storage
 
