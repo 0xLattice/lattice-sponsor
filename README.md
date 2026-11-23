@@ -63,6 +63,12 @@ Credit is held in memory, so a restart forfeits unspent shares. A chain's
 reward schedule is read once, so a chain re-hosted under the same path with a
 new genesis needs a restart.
 
+Each release (<https://github.com/0xLattice/lattice-sponsor/releases>)
+carries `lattice-sponsor-<version>-linux-amd64.tar.gz` and
+`-macos-arm64.tar.gz`, each with a `.sha256`; the binary is
+`bin/lattice-sponsor` inside. On Linux it needs libcurl4, libsqlite3-0,
+libxml2 and libatomic1, which a Lattice node needs too.
+
 The image `ghcr.io/0xlattice/lattice-sponsor` holds the binary at
 `/usr/local/bin/lattice-sponsor`, for a node image to copy in
 (`COPY --from=ghcr.io/0xlattice/lattice-sponsor:<tag> ...`) or to run beside
