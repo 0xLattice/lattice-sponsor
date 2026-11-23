@@ -1,0 +1,82 @@
+name: Release
+
+# A version tag builds lattice-sponsor for Linux (amd64) and macOS (arm64)
+# and attaches each as lattice-sponsor-<tag>-<platform>.tar.gz, holding
+# bin/lattice-sponsor, with its .sha256, to the tag's GitHub release.
+
+on:
+  push:
+    tags: ['v*', '[0-9]*']
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/release.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - platform: linux-amd64
+            runner: ubuntu-latest
+            container: swift:6.1-jammy
+            flags: --static-swift-stdlib
+          - platform: macos-arm64
+            runner: macos-15
+            container: ''
+            flags: ''
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies for Linux
+        if: matrix.platform == 'linux-amd64'
+        run: apt-get update && apt-get install -y --no-install-recommends libsqlite3-dev
+
+      - name: Build
+        run: swift build -c release ${{ matrix.flags }} --product lattice-sponsor
+
+      - name: Package
+        id: package
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+        run: |
+          set -euo pipefail
+          name="lattice-sponsor-$VERSION-${{ matrix.platform }}"
+          mkdir -p "dist/$name/bin"
+          cp "$(swift build -c release ${{ matrix.flags }} --show-bin-path)/lattice-sponsor" "dist/$name/bin/"
+          cp LICENSE README.md "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          (cd dist && { command -v sha256sum >/dev/null && sha256sum "$name.tar.gz" || shasum -a 256 "$name.tar.gz"; } > "$name.tar.gz.sha256")
+          "dist/$name/bin/lattice-sponsor" --help | head -1
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/${{ steps.package.outputs.name }}.tar.gz*
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "lattice-sponsor $TAG"
+          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
