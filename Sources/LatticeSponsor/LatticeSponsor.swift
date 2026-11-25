@@ -92,8 +92,6 @@ import FoundationNetworking
 import Hummingbird
 import Lattice
 import cashew
-import LatticeMinerCore
-import LatticeMiningCoordinator
 import LatticeSponsorCore
 import UInt256
 import LatticeNodeAPI
@@ -250,9 +248,6 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
             payoutRecipients: payoutRecipients,
             book: book
         )
-        let templates = HTTPMiningCoordinatorNodeClient(
-            apiBaseURL: base, cookieFile: URL(fileURLWithPath: cookieFile)
-        )
         // A template on each change the node reports, never on a clock.
         let address = signer.address
         let feed = Task {
@@ -261,9 +256,9 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
                 fetch: {
                     // Hosted chains come and go without a restart.
                     let chains = [DEFAULT_ROOT_DIRECTORY] + (try await rpc.hostedChains())
-                    return try await rpc.template(try MiningTemplateRequestBody.make(
-                        recipients: chains.map { "\($0)=\(address)" }, minimumWork: []
-                    ))
+                    return try await rpc.template(MiningTemplateRequest(recipients: chains.map {
+                        MiningRecipient(chainPath: $0.components(separatedBy: "/"), address: address)
+                    }))
                 },
                 install: { await sponsor.install($0, fresh: $1) },
                 blind: { await sponsor.blind() }
@@ -287,9 +282,9 @@ struct LatticeSponsorCommand: AsyncParsableCommand {
             let (response, block, held) = await sponsor.share(assignment: input.assignment, nonce: input.nonce)
             if let block {
                 do {
-                    let submitted = try await templates.submit(workId: block, nonce: input.nonce)
-                    print("block \(block) nonce \(input.nonce): \(submitted.disposition)")
-                    if submitted.disposition == "unknownWork" || submitted.disposition == "stale" {
+                    let disposition = try await rpc.submitWork(SubmitWorkRequest(workID: block, nonce: input.nonce))
+                    print("block \(block) nonce \(input.nonce): \(disposition)")
+                    if disposition == "unknownWork" || disposition == "stale" {
                         await sponsor.retire(workID: block)
                     }
                 } catch {
@@ -602,7 +597,7 @@ actor Sponsor {
         if template.chains == nil { print("the node reports no template chains; upgrade it") }
         ledger.install(SponsorTemplate(
             workID: template.workID,
-            prefixHex: ProofOfWork.proofOfWorkHashPrefixBytes(template.block)
+            prefixHex: Block.makeProofOfWorkPreimagePrefix(block: template.block)
                 .map { String(format: "%02x", $0) }.joined(),
             prices: prices,
             submitTarget: template.searchTarget,
@@ -788,9 +783,7 @@ actor Sponsor {
         guard let held = ledger.assignment(assignment), let prefix = Data(hex: held.prefixHex) else {
             return (.failure(SponsorRefusal.unknownAssignment), nil, nil)
         }
-        let hash = ProofOfWork.hash(
-            midstate: ProofOfWork.midstate(prefixBytes: ContiguousArray(prefix)), nonce: nonce
-        )
+        let hash = ProofOfWorkMidstate(prefix: prefix).hash(nonce: nonce)
         let credited = Result { () throws -> ShareResponse in
             // An upload no longer held is refused before the share is spent.
             if let store = held.store {
@@ -1119,11 +1112,11 @@ struct SponsorRPC: Sendable {
     }
 
     /// A merged template, or nil while the node has none to give.
-    func template(_ body: Data) async throws -> MiningTemplateResponse? {
+    func template(_ body: MiningTemplateRequest) async throws -> MiningTemplateResponse? {
         var request = authorized(base.appendingPathComponent("mining/templates"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = body
+        request.httpBody = try JSONEncoder().encode(body)
         let (data, response) = try await URLSession.shared.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         if status == 409 || status == 503 {
@@ -1132,6 +1125,23 @@ struct SponsorRPC: Sendable {
         }
         guard status == 200 else { throw RPCFailure.status(status) }
         return try JSONDecoder().decode(MiningTemplateResponse.self, from: data)
+    }
+
+    /// `POST /mining/work`: the node's disposition of a block's nonce, or
+    /// the refusal it names (`unknownWork` once the template is gone).
+    func submitWork(_ body: SubmitWorkRequest) async throws -> String {
+        var request = authorized(base.appendingPathComponent("mining/work"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(body)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if status == 200 { return try JSONDecoder().decode(SubmitWorkResponse.self, from: data).disposition.rawValue }
+        struct Refusal: Decodable { struct Reason: Decodable { let message: String }; let error: Reason }
+        guard (400..<500).contains(status), let refusal = try? JSONDecoder().decode(Refusal.self, from: data) else {
+            throw RPCFailure.status(status)
+        }
+        return refusal.error.message
     }
 
     /// `GET /mining/events`: the node's digest on connect and whenever a

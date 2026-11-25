@@ -358,8 +358,9 @@ storage sponsor.
 
 ## Development
 
-It builds on lattice-node's `LatticeNodeAPI`, `LatticeMinerCore` and
-`LatticeMiningCoordinator` libraries, pinned to one commit in `Package.swift`.
+It builds on lattice-node's `LatticeNodeAPI` library (the node's client
+contract), pinned to one commit in `Package.swift`, and on Lattice's
+`LatticePoW` for the proof-of-work hash.
 `Package.resolved` keeps the node's own pins for everything they share.
 
 ```sh

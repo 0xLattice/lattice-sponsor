@@ -18,7 +18,6 @@
 
 import Foundation
 import Lattice
-import LatticeMinerCore
 import LatticeNodeAPI
 import UInt256
 
@@ -340,7 +339,7 @@ public struct SponsorLedger: Sendable {
 
     /// Credit one share: `nonce` inside the assignment's range whose hash
     /// clears the share target. `hash` is the template's PoW hash at `nonce`
-    /// (`ProofOfWork.hash`), computed by the caller from the prefix. Returns
+    /// (`ProofOfWorkMidstate.hash`), computed by the caller from the prefix. Returns
     /// the share's value; an assignment with a store or a peer is not fee
     /// credit, so the caller owes that value to the upload or peer instead.
     ///
