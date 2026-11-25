@@ -74,8 +74,6 @@ jobs:
         working-directory: .deps/lattice-node
         env:
           E2E_NODE_BIN: ${{ github.workspace }}/.deps/lattice-node/.build/release/lattice-node
-          E2E_COORDINATOR_BIN: ${{ github.workspace }}/.deps/lattice-node/.build/release/lattice-mining-coordinator
-          E2E_MINER_BIN: ${{ github.workspace }}/.deps/lattice-node/.build/release/lattice-miner
           E2E_CTL_BIN: ${{ github.workspace }}/.deps/lattice-node/.build/release/lattice
           E2E_SPONSOR_BIN: ${{ github.workspace }}/.build/release/lattice-sponsor
         run: swift test --skip-build --filter 'LatticeCtlE2ETests.testAnUnfundedKey'

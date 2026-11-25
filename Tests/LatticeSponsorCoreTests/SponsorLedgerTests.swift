@@ -3,7 +3,6 @@ import XCTest
 import Lattice
 import UInt256
 import cashew
-import LatticeMinerCore
 @testable import LatticeSponsorCore
 
 /// `2^k - 1`: its work, `floor(2^256 / (target + 1))`, is exactly 2^(256-k).
