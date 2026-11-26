@@ -1,360 +1,90 @@
 # lattice-sponsor
 
-Pays Lattice transaction fees for clients who pay in proof of work.
+lattice-sponsor is a service that pays Lattice transaction fees for clients
+who pay in proof of work. An operator runs it beside a
+[Lattice node](https://lattice.build/docs/run/getting-started/); wallets and
+web pages call it over HTTP.
 
-A client with no balance grinds shares of the sponsor's merged block template,
-then sends a draft transaction. The sponsor adds a debit of the fee from its
-own account on the draft's chain and co-signs. The client signs the same body
-and submits it to any node: it carries a real fee.
+It is for:
 
-The template pays the sponsor on Nexus and every chain the node hosts, so each
-share earns the sponsor on all of them at once. The client earns on the one
-chain it names. Each share is credited when it is accepted, at its template's
-price on that chain: its chance of clearing that chain's block, times that
-block's reward. A fee is paid from that chain's credit. Credit backed by one
-block height stops at that block's reward, since only one block per height can
-win.
+- **Operators** who want people with no coins to be able to transact on the
+  chains their node hosts.
+- **Client developers** whose users have no balance to pay a fee with.
 
-## Running it
+## How it works
 
-It runs beside a node and reaches it only over the node's loopback RPC, as a
-miner does. It asks for a template whenever the node reports a change
-(`GET /mining/events`: a hosted chain's tip or pool, or the hosted set), never
-on a clock: proof-of-work arrivals are memoryless, so work stays valid until a
-template on a new tip replaces it. It needs a node with that route; against an
-older one it logs the failure and keeps retrying.
+1. The sponsor hands a client a nonce range of its node's merged block
+   template. The client grinds it and sends back shares: nonces whose hash
+   clears an easier target than a block's.
+2. Each accepted share is credited on the one chain the client names, at the
+   template's price there: its chance of clearing that chain's block, times
+   that block's reward.
+3. The client sends a draft transaction. The sponsor adds a debit of the fee
+   from its own account on the draft's chain and co-signs.
+4. The client signs the same body and submits it to any node. It carries a
+   real fee.
 
-```sh
-lattice-sponsor \
-  --node http://127.0.0.1:8080 \
-  --cookie-file ~/.lattice/chains/Nexus/.cookie \
-  --key sponsor.key \
-  --port 8650
-```
+The template pays the sponsor on Nexus and every chain the node hosts, so
+each share earns the sponsor on all of them at once. A share that clears a
+block's target is that block, and the sponsor submits it. Credit backed by
+one block height stops at that block's reward, since only one block per
+height can win.
 
-- `--key` is a `lattice key generate` key file. It holds the fee float on every
-  chain, **and nothing else**: a co-signature lends the key's authority to the
-  body, so the key must own nothing a draft could reach.
-- `--share-work` (default `2^24`) is the work per share.
-- `--fee` is the smallest fee it pays; the node's relay floor applies when that
-  is higher.
-- `--most-pay` is the most coins it pays a client within one transaction, for
-  that client's shares. With it, a client with no coins can pay someone else:
-  buying a name, say. It defaults to the chain's block reward at the
-  template's height; at 0 it pays fees only.
+The same work can also buy a pin for a file, a peer's serving standing on
+the node, or coin paid out to an address. An operator turns each on with a
+flag ([Optional services](docs/operating.md#optional-services)).
 
-- `--sell-storage` lets work buy a pin for a file, kept until the operator
-  takes it down (see [Storage](#storage) and
-  [Abuse and takedowns](#abuse-and-takedowns)), with `--storage-rate`,
-  `--storage-file` and `--storage-budget`: the most bytes pinned at once,
-  uploads not yet pinned included (default `1073741824`, 1 GiB).
-- `--serving-rate` lets work buy a peer serving standing on the node (see
-  [Serving](#serving)).
-- `--pay-to` lets coin buy storage or serving too (see
-  [Paying in coin](#paying-in-coin)), with `--coin-depth`. Without either, it
-  only publishes the address as `payTo` in `GET /terms`.
-- `--funds` lets a site lend the sponsor float for the transactions under
-  some key prefixes (see [Funds](#funds)), with `--funded-only`.
-- `--payout-at` lets work earn coin outright: work naming a `payTo` address
-  is paid out in coin once it has earned that many (see [Payouts](#payouts)),
-  with `--payout-recipients`.
+## Quickstart
 
-Credit is held in memory, so a restart forfeits unspent shares. A chain's
-reward schedule is read once, so a chain re-hosted under the same path with a
-new genesis needs a restart.
+You need a running node ([Getting started](https://lattice.build/docs/run/getting-started/))
+and its `lattice` command-line tool.
 
-Each release (<https://github.com/0xLattice/lattice-sponsor/releases>)
-carries `lattice-sponsor-<version>-linux-amd64.tar.gz` and
-`-macos-arm64.tar.gz`, each with a `.sha256`; the binary is
-`bin/lattice-sponsor` inside. On Linux it needs libcurl4, libsqlite3-0,
-libxml2 and libatomic1, which a Lattice node needs too.
+1. Get the binary. Each
+   [release](https://github.com/0xLattice/lattice-sponsor/releases) carries
+   `lattice-sponsor-<version>-linux-amd64.tar.gz` and `-macos-arm64.tar.gz`,
+   each with a `.sha256`; the binary is `bin/lattice-sponsor` inside. Or
+   build it: `swift build -c release`.
 
-The image `ghcr.io/0xlattice/lattice-sponsor` holds the binary at
-`/usr/local/bin/lattice-sponsor`, for a node image to copy in
-(`COPY --from=ghcr.io/0xlattice/lattice-sponsor:<tag> ...`) or to run beside
-one.
+2. Create a key for the sponsor alone:
 
-## Routes
+   ```sh
+   lattice key generate --out sponsor.key
+   ```
 
-JSON; 64-bit integers are decimal strings, and targets and work are hex.
+   The key holds the coin fees are paid from (the float) on every chain,
+   **and nothing else** ([why](docs/risks.md#the-key)).
 
-| Route | Body | Returns |
+3. Start it against the node's operator port, with the node's cookie file:
+
+   ```sh
+   lattice-sponsor \
+     --node http://127.0.0.1:8080 \
+     --cookie-file ~/.lattice/chains/Nexus/.cookie \
+     --key sponsor.key \
+     --port 8650
+   ```
+
+   It prints `sponsor <address> listening on 127.0.0.1:8650`.
+
+4. Send coin to that address on each chain it is to pay fees on. A fee it
+   cannot cover is refused (`insufficientFloat`).
+
+5. Check that it answers:
+
+   ```sh
+   curl -s http://127.0.0.1:8650/terms
+   ```
+
+## Documentation
+
+| Page | For | Holds |
 |---|---|---|
-| `POST /work` | `{client?, chain?, pay?, store? \| peer? \| payTo?}` | a nonce range of the template, and the shares that buy the fee and `pay` |
-| `POST /shares` | `{assignment, nonce}` | the client's credit on its chain (for payout work, the address's unpaid earnings), and `serving` bytes for serving work |
-| `POST /sponsor` | `{client, transaction, pay?, fund?}` | the co-signed transaction |
-| `POST /store` | `{root, volumes: [{cid, entries?, bytes?}]}` | `{root, bytes, needed, credit, stored}` |
-| `GET /store/:root` | | `{root, bytes, needed, credit, stored}` |
-| `POST /pay` | `{chain, txCID, signer, signature, store \| peer \| fund}` | `{bytes}` bought, and a fund's `deposit` |
-| `GET /fund?chain=<path>&prefix=<p>...` | | `{deposit, held}` |
-| `GET /earnings?chain=<path>&address=<a>` | | `{earned, payoutAt, paying}`, with `--payout-at` |
-| `GET /terms` | | `{address, payTo, depth, storageRates, servingRates, fundTo?, payoutAt?, storage?}`; `address` is the sponsor key's own, always; with `--sell-storage`, `storage` is `{budget, stored, held}` in bytes |
-| `POST /takedown` | `{cid}` | `{cid, unpinned}`; operator only (see [Abuse and takedowns](#abuse-and-takedowns)) |
+| [Operating lattice-sponsor](docs/operating.md) | Operators | Every flag, what it needs from the node, the files it keeps, supervision, monitoring, takedowns. |
+| [lattice-sponsor HTTP API](docs/api.md) | Client developers | Each route, its fields and refusals, the proof-of-work and signature formats. |
+| [lattice-sponsor operator risks](docs/risks.md) | Anyone deciding whether to run or trust one | What the operator's coin and node are exposed to, and the limits that bound it. |
 
-With a `pay`, the sponsor credits the client `pay` within the transaction, and
-debits itself the fee plus `pay`. The client's own debits net against that
-credit, so a purchase of exactly `pay` draws nothing from the client's
-balance.
-
-### Refusals
-
-A refusal is JSON, `{"error":{"message":"<name>"}}`, and carries
-`Access-Control-Allow-Origin: *` like every answer, so a web page can read it.
-Clients match on the name; the status groups them. Two are routine on
-`/shares`, and both mean the same thing to a client: the work is spent, so ask
-`POST /work` again with the same `client` token (its credit is kept) and grind
-the new range.
-
-- `unknownAssignment` (400): the sponsor no longer holds the assignment.
-  Work on every earlier template is dropped when a block lands on the tip
-  (and when the sponsor reconnects to its node or restarts), so every worker
-  sees this about once per block.
-- `expired` (400): the assignment's template is still held, but the chain
-  the shares are credited on has moved past the block it carries, so its
-  shares can no longer win it.
-
-Three refusals carry `Retry-After` in seconds, exposed to pages
-(`Access-Control-Expose-Headers`): `busy` and `soldOut` (503) and
-`notDeepEnough` (425). Each clears as the chain moves, so the value is a hint:
-no clock predicts when it does. `unpriceable` and `insufficientFloat` (503)
-carry none: they may never clear (a chain whose emission has ended, a sponsor
-with no float). Nor does `blocked` (451): the operator took the CID down.
-
-## Storage
-
-A storage sponsor keeps files, for proof of work that mines real blocks, until
-its operator takes one down. Anyone can run one, and an uploader can use several. The uploader
-trusts the host for availability only: bytes are checked by CID.
-
-With `--sell-storage`, an uploader sends `POST /store` with the file's root
-and every Volume in it, root included. A Volume carries its `entries` (CID to
-base64 bytes, as the node's `POST /pins` takes), or only its declared `bytes`,
-to be read later with the node's `GET /fetch` (and refused if larger). A
-Volume's entries include its root, and a Volume is at most 1 MiB and 1 KiB
-(a 1 MiB chunk of a file and its block's framing). An
-upload that does not fit in what is left of `--storage-budget` is refused
-(`overBudget`, 400): the budget counts every byte pinned and every upload not
-yet pinned, so a paid upload always fits. `GET /terms` answers
-`storage: {budget, stored, held}`; room for an upload is
-`budget - stored - held`. The answer's `needed` is the coins of work still owed on each
-chain `--storage-rate <chain>=<bytesPerCoin>` prices; `credit` is the bytes
-paid.
-
-The uploader then asks `POST /work` with `store: <root>` on a chain with a
-storage rate (otherwise `noStorageRate`), and posts shares as usual. Storage
-credit pays no fee or `pay`. Once it covers the upload's bytes, the
-sponsor pins every Volume with the node's `POST /pins`, which checks each
-against its CID, and adds `{root, bytes, volumes}` to `--storage-file`. It
-stays pinned until the operator takes it down. An upload not yet paid is held in memory for an hour, and a
-paid one until it is pinned; a restart forfeits either, with its credit, as it
-does fee credit.
-
-## Abuse and takedowns
-
-Every pinned file is served by the operator's node, from the operator's IP
-address, to anyone who asks for it. The sponsor does not look at what it pins:
-anyone who pays can upload anything, so the operator answers for what it
-serves and must be able to remove it.
-
-`POST /takedown {"cid": "<cid>"}` takes a CID down: an upload's root, or one
-of its Volumes. It needs the node's RPC cookie, the operator's credential for
-the node's own operator routes, sent the same way:
-`Authorization: Basic <base64 of the --cookie-file's content>` (otherwise
-401). The sponsor then:
-
-- blocks the CID, and the root and every Volume of each upload naming it,
-  pinned or not, for good, in `lattice-sponsor-blocklist.json` beside
-  `--storage-file` (mode 0600). An upload naming a blocked CID as its root or
-  a Volume is refused (`blocked`, 451) on `POST /store`, and so is work or
-  coin for it on `POST /work`, `POST /shares` and `POST /pay`, so a new
-  manifest listing the same chunks cannot pin them again. A Volume the
-  taken-down file shares with an innocuous one is blocked too: a later upload
-  of that other file is refused, though one already pinned keeps it.
-  `POST /sponsor` pins nothing;
-- unpins, with the node's `DELETE /pins/:cid`, every Volume of the pinned
-  uploads naming it, and of those it tried to pin before and failed, that no
-  other upload, pinned or being pinned, keeps (a Volume the node does not
-  hold, 404, is already released), so
-  the node releases them as it does any unpinned Volume. It unpins only
-  Volumes of its own uploads, never a pin it did not make. It drops any upload
-  naming the CID not yet pinned (one being pinned is unpinned once it is);
-- returns their bytes to `--storage-budget`.
-
-It answers the Volumes it unpinned. If the node refuses an unpin, the CID is
-still blocked and the answer is `notUnpinned` (502): ask again. To unblock a
-CID, remove it from the blocklist file and restart.
-
-**Paid time is not refunded.** Work or coin spent on an upload taken down,
-pinned or not, is forfeited: the sponsor holds no refund float, and refunding
-would pay whoever uploaded what had to be removed. An uploader who needs the
-file kept stores it with other sponsors too.
-
-The sponsor logs, to standard output, each upload it pins (root, bytes,
-Volumes) and each takedown (the CID and the Volumes unpinned). It logs no
-uploader's address or identity: `--storage-file` holds only roots, bytes and
-Volumes, and the blocklist only CIDs. Logs of who connected are the
-operator's own proxy's.
-
-## Serving
-
-The node serves anyone free while it has free serving slots. When it is busy,
-peers share its slots by standing: a byte balance per peer, used up by the
-bytes it is served. Credit only raises a peer's share when the node is busy.
-
-With `--serving-rate <chain>=<bytesPerCoin>` (repeatable), a client asks
-`POST /work` with `peer: <the peer's 64 lowercase hex Ed25519 key>` instead of
-`store`, on a chain with a serving rate (otherwise `noServingRate`). Each
-accepted share's value times the rate, rounded down, is posted to the node's
-`POST /serving-credit` at once, and `/shares` answers it as `serving`; a share
-worth less than a byte credits nothing. If the node does not take it,
-`/shares` is refused `servingNotCredited` (502): the share is spent and its
-serving credit lost. Serving credit pays no fee, `pay` or storage, and fee or
-storage credit buys no serving.
-
-## Paying in coin
-
-With `--pay-to <address>` (and `--sell-storage` or `--serving-rate`), an
-uploader can pay in coin instead of work, at the same `--storage-rate`. It sends coins to that address
-on a chain with a rate, then, once the transaction is `--coin-depth` (default
-6) blocks below the tip of the node's canonical chain, claims it with
-`POST /pay`, naming the upload's root as `store`. `signer` is one of the
-transaction's signers, and `signature` its `CryptoUtils.sign` signature over
-`lattice-sponsor-pay:v1:<chain>:<txCID>:<store>`.
-
-What the transaction pays `--pay-to` on that chain, net, times the rate, is
-added to the upload's credit, which pins it once paid. Named `peer` instead of
-`store`, the signature is over
-`lattice-sponsor-pay-serving:v1:<chain>:<txCID>:<peer>`, and the transfer
-times `--serving-rate` is posted to the node's `POST /serving-credit` in one
-call; if that fails (`servingNotCredited`, 502), the transaction is still
-credited and the payment used up, as with any node failure after the claim. Each transaction is credited once; the ones credited are kept in
-`lattice-sponsor-payments.json` beside `--storage-file`. Refusals are named:
-`notIncluded` (404), `notDeepEnough` (425, retry later), `notSigner`,
-`invalidSignature`, `noPayment`, `alreadyCredited` (409). The sponsor reads
-the transaction through the node's `GET /api/transaction`, `GET /api/block`
-and `GET /transactions` routes, so the node keeps every state and block body
-(`--state all --block-bodies all`). `GET /terms` publishes `payTo`, `depth`
-and the storage rates.
-
-## Funds
-
-A fund is float a site lends the sponsor, so that one operator's coin does
-not bound how many sites it sponsors. Every fee the sponsor signs is held
-against its key's balance until it is mined; a fund's deposit sits in that
-balance, and holds the fees of its own site's transactions. With
-`--funded-only` the operator puts up no float at all: every transaction it
-signs is held against a site's deposit.
-
-A fund is not a fee or a payment to the operator, and nothing is drawn from
-it. Readers still pay for each fee with work, exactly as without a fund; that
-work earns the sponsor's key the template's rewards, which repay the fees, so
-on average a deposit stays the site's.
-
-A fund is named by its key prefixes: 1 to 8 non-empty strings of at most 128
-bytes, without a newline, compared as bytes. The sponsor sorts them by their
-UTF-8 bytes and drops repeats, so `["b/", "a/"]` and `["a/", "b/", "a/"]` are
-one fund. A fund is kept per chain.
-
-With `--funds`, a site sends coins to the sponsor's own address (`fundTo` in
-`GET /terms`) and claims the transfer with `POST /pay`, naming
-`fund: [prefix, ...]` instead of `store` or `peer`, as in
-[Paying in coin](#paying-in-coin); `--pay-to` is not needed, and a transfer to
-any other address funds nothing. `signature` is over
-`lattice-sponsor-pay-fund:v1:<chain>:<txCID>:<prefixes>`, the prefixes
-normalized and joined by `\n`. What the transaction pays the sponsor, net, is
-added to the fund's deposit, once per transaction; the answer is
-`{bytes: "0", deposit}`. Deposits are kept in `lattice-sponsor-funds.json`
-beside `--storage-file`, and every fee held in `lattice-sponsor-holds.json`
-beside it, so both survive a restart. There is no withdrawal yet.
-
-A reader names the fund on `POST /sponsor` as `fund: [prefix, ...]`. The fund
-backs the transaction when the transaction writes at least one key, every key
-it writes starts with one of the fund's prefixes, and the fee and `pay` fit in
-the deposit beside what the fund already holds, and its signer holds no
-transaction under the fund at another nonce. A backed transaction is held
-against the fund; any other is held against the operator's own float, as
-without funds. With `--funded-only` it is refused instead: `inFlight` (409)
-when the signer already holds one under the fund, else `notFunded` (402).
-Either way the key's whole balance must still cover every hold
-(`insufficientFloat`).
-
-A hold lasts until the signer's nonce on the chain passes the transaction's:
-it landed, or another transaction took its nonce and it never can. The sponsor
-reads the nonces whenever the node reports a change, never on a clock. A
-transaction the host dropped stays held, since it can still be resubmitted;
-one signer holds one at a time under a fund, so a reader who never submits
-keeps at most one fee of it. A redraft at the held nonce replaces the hold,
-keeping the larger amount, since only one of the two can land.
-`GET /fund?chain=<path>&prefix=<p>&prefix=<q>` answers `{deposit, held}`;
-room for more is `deposit - held`.
-
-## Payouts
-
-With `--payout-at <coins>`, the sponsor is also a pay-per-share pool. A
-client asks `POST /work` with `payTo: <address>` (and no `pay`, `store` or
-`peer`); each share it hands back is owed to that address on the chain named,
-at the template's price there. No key or token is needed to earn: work only
-ever pays the address it names. `GET /earnings` reads what an address is owed.
-
-After each template, the sponsor pays the addresses owed at least
-`--payout-at` coins on a chain, up to `--payout-recipients` (default 64) of
-them, largest first, whole coins (the fraction stays owed), in one
-transaction it signs alone at its next nonce there. Payout work backs at most
-half of each height's block, so fee work, which a person is waiting on, always
-has the other half.
-
-A payout moves coin that must be paid once, so it is judged by the chain,
-never by what a send answered:
-
-- It is written to `lattice-sponsor-payouts.json` (beside `--storage-file`),
-  with its coins taken off what is owed, before it is first sent. A failed
-  send or a crash loses nothing: it is sent again with each template.
-- The sponsor signs nothing else as first signer, and nothing else at a
-  payout's nonce but a replacement paying the same coins to the same
-  addresses (when the node's fee floor rises past its fee). Whichever version
-  lands, each address is paid once.
-- It settles once a version is `--coin-depth` blocks deep in the canonical
-  chain, or once the sponsor's nonce has been past it that long even if the
-  node shows no version: the nonce moving proves one landed. That payout is
-  kept as unconfirmed and logged with a warning.
-- Its coins are never owed again on the sponsor's own judgement. If you signed
-  another transaction at that nonce with the sponsor's key elsewhere, restart
-  with `--payout-release <nonce>@<chain>` to owe them again.
-
-One payout is pending per chain, and what it can debit is kept out of the
-float sponsored fees draw on.
-
-## What it risks
-
-A client can withhold the shares that are blocks, as against any pool, and
-nothing here detects it. Its credit then buys fees, and with `--most-pay`,
-coins paid to the client itself: up to the fee plus `--most-pay` (by default a
-block reward) per transaction, from the key's balance, which also holds the
-blocks the sponsor wins. The float is the operator's bound on that loss; set
-`--most-pay 0` to keep it to fees.
-
-Payouts are the same bet without the cap per transaction: each share is paid
-at its expected value whether or not it wins, and the sponsor keeps the
-blocks it does win. On average the float neither grows nor shrinks by it; a
-run of bad luck, or shares withheld, draw it down, and a payout that no longer
-fits the float waits until it does. Don't sign transactions with the
-sponsor's key elsewhere: one that takes a pending payout's nonce leaves that
-payout unconfirmed and unpaid until you release it with `--payout-release`.
-
-A signed fee and pay are held against the float until the client's nonce
-passes them, so a body never submitted stays held. Its client paid for it in
-work, which earns the key as much on average. Without `--funds`, holds are
-kept in memory, and a restart forgets them.
-
-A fund's deposit joins the key's one balance, so its luck is shared: blocks
-the readers' work fails to win, and shares withheld by any client, cost every
-deposit and the operator's float alike, not the site whose readers caused
-them. A fund backs only transactions that write nothing but keys under its
-prefixes, but anyone may fund any prefixes and anyone who writes under them
-uses the fund's room: a site's prefixes should be ones only its own readers
-write. Deposits cannot be withdrawn yet. The operator holds the coin and keeps
-the deposits, and a site trusts it to do so honestly, as an uploader trusts a
-storage sponsor.
+The TypeScript client is `SponsorClient` in
+[`@adalin/lattice-relay`](https://github.com/0xLattice/lattice-sdk/tree/main/packages/relay).
 
 ## Development
 
